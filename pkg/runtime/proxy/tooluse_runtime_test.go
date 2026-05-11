@@ -12,12 +12,12 @@ import (
 	"time"
 
 	"github.com/clawvisor/clawvisor/internal/runtime/conversation"
-	"github.com/clawvisor/clawvisor/pkg/runtime/leases"
 	runtimepolicy "github.com/clawvisor/clawvisor/internal/runtime/policy"
-	"github.com/clawvisor/clawvisor/pkg/runtime/review"
-	"github.com/clawvisor/clawvisor/pkg/store/sqlite"
 	"github.com/clawvisor/clawvisor/pkg/config"
+	"github.com/clawvisor/clawvisor/pkg/runtime/leases"
+	"github.com/clawvisor/clawvisor/pkg/runtime/review"
 	"github.com/clawvisor/clawvisor/pkg/store"
+	"github.com/clawvisor/clawvisor/pkg/store/sqlite"
 	"github.com/elazarl/goproxy"
 )
 
@@ -776,7 +776,7 @@ func TestStreamToolUseBlockRewritesBlockedAnthropicSSE(t *testing.T) {
 	if !strings.Contains(string(body), "Clawvisor paused:") {
 		t.Fatalf("expected blocked Anthropc SSE to contain approval prompt, got %s", string(body))
 	}
-	rec, err := st.GetApprovalRecordByRequestID(ctx, "runtime-tooluse:"+session.id+":toolu_1")
+	rec, err := st.GetApprovalRecordByRequestID(ctx, "runtime-tooluse:"+session.id+":toolu_1", session.userID)
 	if err != nil {
 		t.Fatalf("GetApprovalRecordByRequestID: %v", err)
 	}
@@ -848,7 +848,7 @@ func TestStreamToolUseBlockRewritesBlockedOpenAISSE(t *testing.T) {
 	if !strings.Contains(string(body), "Clawvisor paused:") {
 		t.Fatalf("expected blocked OpenAI SSE to contain approval prompt, got %s", string(body))
 	}
-	rec, err := st.GetApprovalRecordByRequestID(ctx, "runtime-tooluse:"+session.id+":call_1")
+	rec, err := st.GetApprovalRecordByRequestID(ctx, "runtime-tooluse:"+session.id+":call_1", session.userID)
 	if err != nil {
 		t.Fatalf("GetApprovalRecordByRequestID: %v", err)
 	}
@@ -920,12 +920,88 @@ func TestStreamToolUseBlockRewritesBlockedOpenAIChatSSE(t *testing.T) {
 	if !strings.Contains(string(body), "Clawvisor paused:") {
 		t.Fatalf("expected blocked OpenAI chat SSE to contain approval prompt, got %s", string(body))
 	}
-	rec, err := st.GetApprovalRecordByRequestID(ctx, "runtime-tooluse:"+session.id+":call_2")
+	rec, err := st.GetApprovalRecordByRequestID(ctx, "runtime-tooluse:"+session.id+":call_2", session.userID)
 	if err != nil {
 		t.Fatalf("GetApprovalRecordByRequestID: %v", err)
 	}
 	if rec.ResolutionTransport != "release_held_tool_use" {
 		t.Fatalf("expected held approval transport, got %+v", rec)
+	}
+}
+
+func TestEnsureHeldToolUseApproval_PreTaskLookupIgnoresTaskScopedSiblings(t *testing.T) {
+	ctx := context.Background()
+	db, err := sqlite.New(ctx, t.TempDir()+"/tooluse-pre-task.db")
+	if err != nil {
+		t.Fatalf("sqlite.New: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	st := sqlite.NewStore(db)
+	userID, agentID := seedRuntimePrincipal(t, st)
+
+	session := createRuntimeSession(t, st, "runtime-pre-task-session", userID, agentID, false)
+	runtimeSession, err := st.GetRuntimeSession(ctx, session.id)
+	if err != nil {
+		t.Fatalf("GetRuntimeSession: %v", err)
+	}
+
+	requestID := "runtime-tooluse:" + session.id + ":call_shared"
+	sessionID := session.id
+	for _, taskID := range []string{"task-sibling-a", "task-sibling-b"} {
+		task := &store.Task{
+			ID:               taskID,
+			UserID:           userID,
+			AgentID:          agentID,
+			Purpose:          "Sibling " + taskID,
+			Status:           "active",
+			Lifetime:         "session",
+			SchemaVersion:    2,
+			ExpiresInSeconds: 3600,
+		}
+		if err := st.CreateTask(ctx, task); err != nil {
+			t.Fatalf("CreateTask(%s): %v", taskID, err)
+		}
+		taskIDCopy := taskID
+		if err := st.CreateApprovalRecord(ctx, &store.ApprovalRecord{
+			ID:                  "approval-" + taskID,
+			Kind:                "task_call_review",
+			UserID:              userID,
+			AgentID:             &agentID,
+			RequestID:           &requestID,
+			TaskID:              &taskIDCopy,
+			SessionID:           &sessionID,
+			Status:              "pending",
+			Surface:             "inline",
+			SummaryJSON:         json.RawMessage(`{}`),
+			PayloadJSON:         json.RawMessage(`{}`),
+			ResolutionTransport: "release_held_tool_use",
+		}); err != nil {
+			t.Fatalf("CreateApprovalRecord(%s): %v", taskID, err)
+		}
+	}
+
+	srv, err := NewServer(Config{DataDir: t.TempDir(), Addr: "127.0.0.1:0"}, nil)
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	hooks := ToolUseHooks{
+		Store:       st,
+		Config:      config.Default(),
+		ReviewCache: review.NewApprovalCache(),
+		Leases:      leases.Service{Store: st},
+	}
+	rec, held, substitute := srv.ensureHeldToolUseApproval(ctx, hooks, runtimeSession, nil, conversationToolUse("call_shared", "Read"), map[string]any{"file_path": "/tmp/demo.txt"})
+	if rec == nil {
+		t.Fatalf("expected pre-task approval record despite task-scoped siblings, got nil with substitute %q", substitute)
+	}
+	if rec.TaskID != nil {
+		t.Fatalf("expected a pre-task approval record, got task_id=%q", *rec.TaskID)
+	}
+	if held == nil {
+		t.Fatal("expected held approval for pre-task record")
+	}
+	if !strings.Contains(substitute, "Clawvisor paused:") {
+		t.Fatalf("expected held approval prompt, got %q", substitute)
 	}
 }
 

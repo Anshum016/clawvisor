@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	sqlitestore "github.com/clawvisor/clawvisor/pkg/store/sqlite"
 	"github.com/clawvisor/clawvisor/pkg/notify"
@@ -106,5 +107,59 @@ func notifyConnectionRequest(userID string) notify.ConnectionRequest {
 		IPAddress:    "127.0.0.1:4321",
 		ApproveURL:   "http://example.com/approve",
 		DenyURL:      "http://example.com/deny",
+	}
+}
+
+// TestCallbackTokenStore_TaskIDRoundTrips guards the symmetric-dedup
+// disambiguator for Telegram inline buttons: Generate must persist the
+// taskID alongside (type, target_id) and Consume must surface it on the
+// returned entry so the decision consumer can route to the correct sibling
+// pending approval. Without this, two pending approvals sharing a
+// request_id across tasks would emit indistinguishable CallbackDecisions
+// and the resolver would hit ErrAmbiguous.
+func TestCallbackTokenStore_TaskIDRoundTrips(t *testing.T) {
+	t.Parallel()
+	s := newCallbackTokenStore()
+
+	approveA, denyA, err := s.Generate("approval", "req-X", "user-1", "task-A", "chat-1", time.Minute)
+	if err != nil {
+		t.Fatalf("Generate(task-A): %v", err)
+	}
+	approveB, denyB, err := s.Generate("approval", "req-X", "user-1", "task-B", "chat-1", time.Minute)
+	if err != nil {
+		t.Fatalf("Generate(task-B): %v", err)
+	}
+	if approveA == approveB || denyA == denyB {
+		t.Fatalf("Generate must mint unique tokens per sibling, got dup")
+	}
+
+	gotA, err := s.Consume(approveA)
+	if err != nil {
+		t.Fatalf("Consume(approveA): %v", err)
+	}
+	if gotA.TaskID != "task-A" || gotA.TargetID != "req-X" {
+		t.Fatalf("Consume(approveA): TaskID=%q TargetID=%q, want task-A/req-X", gotA.TaskID, gotA.TargetID)
+	}
+
+	gotB, err := s.Consume(denyB)
+	if err != nil {
+		t.Fatalf("Consume(denyB): %v", err)
+	}
+	if gotB.TaskID != "task-B" || gotB.TargetID != "req-X" {
+		t.Fatalf("Consume(denyB): TaskID=%q TargetID=%q, want task-B/req-X", gotB.TaskID, gotB.TargetID)
+	}
+
+	// Pair-state is shared per (approve, deny) entry: consuming approveA
+	// must invalidate denyA, and consuming denyB must invalidate approveB
+	// (so a user can't both approve and deny the same target). Cross-task
+	// siblings remain independent because they were minted from separate
+	// Generate calls — approveA / denyA carry task-A's entry, approveB /
+	// denyB carry task-B's, and consuming any one of the four does NOT
+	// touch the other task's pair.
+	if _, err := s.Consume(denyA); err != errTokenUsed {
+		t.Fatalf("Consume(denyA after approveA): want errTokenUsed, got %v", err)
+	}
+	if _, err := s.Consume(approveB); err != errTokenUsed {
+		t.Fatalf("Consume(approveB after denyB): want errTokenUsed, got %v", err)
 	}
 }

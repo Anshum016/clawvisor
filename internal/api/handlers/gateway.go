@@ -252,25 +252,32 @@ func (h *GatewayHandler) HandleRequest(w http.ResponseWriter, r *http.Request) {
 	if req.RequestID == "" {
 		req.RequestID = uuid.New().String()
 	} else {
-		// Dedup: if this request_id was already processed under the same task,
-		// return the existing outcome without re-processing. This prevents
-		// duplicate audit entries and re-execution of side-effect actions when
-		// the agent retries after a network timeout.
+		// Dedup: if this (request_id, user, task) already has a canonical row,
+		// return its outcome without re-processing. FindDedupCandidate encodes
+		// the precedence directly — pre-task canonicals (task_id IS NULL) win
+		// over task-scoped canonicals for the same request_id, oldest-first
+		// within a tier — so a sibling task that landed its own canonical
+		// under symmetric scope doesn't shadow our retry's pre-task or
+		// same-task winner. Using the request_id-only getter here would
+		// silently return that sibling's "latest canonical" instead.
 		//
-		// The dedup is scoped to the same task_id so that reusing a request_id
-		// across different tasks/sessions is treated as a fresh request.
-		// Pre-task outcomes (e.g. "blocked" by restriction) have no task_id
-		// and are always dedup'd since they're stateless checks.
-		if existing, err := h.store.GetAuditEntryByRequestID(ctx, req.RequestID, agent.UserID); err == nil {
-			preTask := existing.TaskID == nil // blocked/error before task scope
-			sameTask := req.TaskID != "" && existing.TaskID != nil && *existing.TaskID == req.TaskID
-			if preTask || sameTask {
-				writeGatewayStatusResponse(w, existing, gatewayStatusResponseOptions{
-					Deduped: true,
-					Message: "Duplicate request_id reused; returning the existing result. Use a new request_id for a new request.",
-				})
-				return
+		// If the canonical is an in-flight adapter reservation
+		// (decision=="execute", outcome=="pending"), wait for it to
+		// resolve so the deduped response reflects the actual outcome,
+		// not the transient "pending" reservation. Approval-pending and
+		// other long-lived states return immediately.
+		if existing, err := h.store.FindDedupCandidate(ctx, req.RequestID, agent.UserID, req.TaskID); err == nil {
+			final := existing
+			if existing.Decision == "execute" && existing.Outcome == "pending" && h.eventHub != nil {
+				if resolved := h.waitForRequestResolution(ctx, req.RequestID, agent.UserID, req.TaskID, longPollDeadline(r)); resolved != nil {
+					final = resolved
+				}
 			}
+			writeGatewayStatusResponse(w, final, gatewayStatusResponseOptions{
+				Deduped: true,
+				Message: "Duplicate request_id reused; returning the existing result. Use a new request_id for a new request.",
+			})
+			return
 		}
 	}
 	middleware.AddLogField(ctx, "request_id", req.RequestID)
@@ -484,10 +491,21 @@ func (h *GatewayHandler) HandleRequest(w http.ResponseWriter, r *http.Request) {
 			middleware.AddLogField(ctx, "outcome", "pending")
 			e := baseEntry("approve", "pending", nil)
 			e.DurationMS = int(time.Since(start).Milliseconds())
-			if logErr := h.store.LogAudit(ctx, e); logErr != nil {
+			winner, logErr := h.logAuditCanonical(ctx, e)
+			if logErr != nil {
 				h.logger.Warn("audit log failed", "err", logErr)
 			}
 			h.publishAuditAndQueue(agent.UserID, "")
+			if winner != nil {
+				// Same-scope race (pre-task scope: task_id IS NULL).
+				// Another worker already enqueued the approval; surface
+				// its row without creating a duplicate pending.
+				writeGatewayStatusResponse(w, winner, gatewayStatusResponseOptions{
+					Deduped: true,
+					Message: "Duplicate request_id reused; awaiting the existing approval. Use a new request_id for a new request.",
+				})
+				return
+			}
 			expiresAt := time.Now().Add(time.Duration(h.cfg.Approval.Timeout) * time.Second)
 			blob := buildRequestBlob(req, agent)
 			reason := "raw request needs review before execution"
@@ -498,13 +516,17 @@ func (h *GatewayHandler) HandleRequest(w http.ResponseWriter, r *http.Request) {
 				h.logger.Warn("route to approval failed", "err", routeErr)
 			}
 			if r.URL.Query().Get("wait") == "true" && h.eventHub != nil {
-				pa := h.waitForApprovalDecision(r.Context(), req.RequestID, agent.UserID, longPollDeadline(r))
+				pa := h.waitForApprovalDecision(r.Context(), req.RequestID, agent.UserID, req.TaskID, longPollDeadline(r))
 				if pa != nil && pa.Status == "approved" && !time.Now().After(pa.ExpiresAt) {
 					h.executeAndRespond(w, r.Context(), pa, agent.ID)
 					return
 				}
 				if pa == nil {
-					if entry, err := h.store.GetAuditEntryByRequestID(r.Context(), req.RequestID, agent.UserID); err == nil && entry.Outcome != "pending" {
+					// Pending row was deleted (denied/expired). Scope the audit
+					// lookup to the same task to avoid picking up a sibling
+					// task's canonical for the same request_id under symmetric
+					// dedup.
+					if entry, err := h.store.GetAuditEntryByRequestIDAndTask(r.Context(), req.RequestID, agent.UserID, req.TaskID); err == nil && entry.Outcome != "pending" {
 						writeGatewayStatusResponse(w, entry)
 						return
 					}
@@ -859,6 +881,19 @@ func (h *GatewayHandler) HandleRequest(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 
+				// Reservation before the adapter call (see the cloud branch
+				// below for the full rationale). Local-executor side effects
+				// — file writes, subprocess spawns — are no more idempotent
+				// than a cloud adapter's, so the double-execute window has
+				// to close here too.
+				localReservation := baseEntry("execute", "pending", taskIDPtr)
+				if verdict != nil {
+					localReservation.Verification = intent.MarshalVerdict(verdict)
+				}
+				if !h.reserveExecAndWaitLoser(w, r, localReservation) {
+					return
+				}
+
 				result, execErr = h.localExec.Execute(ctx, agent.UserID, serviceType, req.Action, req.Params)
 			} else {
 				// ── Intent verification ──────────────────────────────────
@@ -985,6 +1020,20 @@ func (h *GatewayHandler) HandleRequest(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 
+				// Reservation: insert the canonical "execute"/"pending" row
+				// BEFORE running the adapter so the partial unique index
+				// on (user_id, request_id, COALESCE(task_id,'')) WHERE
+				// deduped_of IS NULL closes the double-execute window
+				// against concurrent identical requests. See
+				// reserveExecAndWaitLoser for the loser-wait semantics.
+				reservation := baseEntry("execute", "pending", taskIDPtr)
+				if verdict != nil {
+					reservation.Verification = intent.MarshalVerdict(verdict)
+				}
+				if !h.reserveExecAndWaitLoser(w, r, reservation) {
+					return
+				}
+
 				vKey := h.adapterReg.VaultKeyWithAliasForUser(serviceType, serviceAlias, agent.UserID)
 				result, execErr = executeAdapterRequest(ctx, h.vault, h.adapterReg, h.store,
 					agent.UserID, serviceType, req.Action, req.Params, vKey)
@@ -994,13 +1043,17 @@ func (h *GatewayHandler) HandleRequest(w http.ResponseWriter, r *http.Request) {
 					adapter, adapterOK := h.adapterReg.GetForUser(ctx, serviceType, agent.UserID)
 					if adapterOK && adapter.ValidateCredential(nil) != nil {
 						dur := int(time.Since(start).Milliseconds())
-						e := baseEntry("block", "error", taskIDPtr)
-						e.DurationMS = dur
 						code, userErr, auditMsg := serviceNotActivatedResponse(ctx, h.vault, h.store, h.adapterReg, agent.UserID, serviceType, serviceAlias, req.Service, adapter)
-						e.ErrorMsg = &auditMsg
-						if logErr := h.store.LogAudit(ctx, e); logErr != nil {
-							h.logger.Warn("audit log failed", "err", logErr)
+						// Use a fresh background context: see the comment on
+						// finalizeCtx below — if the client cancelled while
+						// we were waiting on the vault, r.Context() is Done
+						// and we'd leave the reservation stuck in "pending".
+						vaultFinalizeCtx, vaultFinalizeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+						defer vaultFinalizeCancel()
+						if updErr := h.store.UpdateAuditOutcome(vaultFinalizeCtx, auditID, "error", auditMsg, dur); updErr != nil {
+							h.logger.Warn("audit outcome update failed", "err", updErr)
 						}
+						outDecision, outOutcome = "execute", "error"
 						h.publishAuditAndQueue(agent.UserID, req.TaskID)
 						writeJSON(w, http.StatusBadRequest, map[string]any{
 							"status":     "error",
@@ -1018,17 +1071,27 @@ func (h *GatewayHandler) HandleRequest(w http.ResponseWriter, r *http.Request) {
 
 			dur := int(time.Since(start).Milliseconds())
 
+			// Finalize the reservation row with a fresh background context.
+			// If the HTTP client cancels mid-adapter, r.Context() is already
+			// Done and UpdateAuditOutcome(ctx) would fail with
+			// "context canceled" — leaving the canonical stuck in "pending"
+			// and shadowing every subsequent retry through the early dedup
+			// check. The adapter call already produced a definitive
+			// result/error; finalization must record it regardless of
+			// client liveness. Five seconds covers the slowest reasonable
+			// audit write on a busy DB.
+			finalizeCtx, finalizeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer finalizeCancel()
+
 			if execErr != nil {
 				errMsg := execErr.Error()
-				e := baseEntry("execute", "error", taskIDPtr)
-				e.DurationMS = dur
-				e.ErrorMsg = &errMsg
-				if logErr := h.store.LogAudit(ctx, e); logErr != nil {
-					h.logger.Warn("audit log failed", "err", logErr)
+				if updErr := h.store.UpdateAuditOutcome(finalizeCtx, auditID, "error", errMsg, dur); updErr != nil {
+					h.logger.Warn("audit outcome update failed", "err", updErr)
 				}
+				outDecision, outOutcome = "execute", "error"
 				h.publishAuditAndQueue(agent.UserID, req.TaskID)
 				if req.Context.CallbackURL != "" {
-					cbKey, _ := h.store.GetAgentCallbackSecret(ctx, agent.ID)
+					cbKey, _ := h.store.GetAgentCallbackSecret(finalizeCtx, agent.ID)
 					h.dispatchCallback(req.Context.CallbackURL, &callback.Payload{
 						Type: "request", RequestID: req.RequestID, Status: "error", Error: errMsg, AuditID: auditID,
 					}, cbKey)
@@ -1045,17 +1108,13 @@ func (h *GatewayHandler) HandleRequest(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
-			// Success
+			// Success — update the reservation to "executed".
 			middleware.AddLogField(ctx, "decision", "execute")
 			middleware.AddLogField(ctx, "outcome", "executed")
-			e := baseEntry("execute", "executed", taskIDPtr)
-			e.DurationMS = dur
-			if verdict != nil {
-				e.Verification = intent.MarshalVerdict(verdict)
+			if updErr := h.store.UpdateAuditOutcome(finalizeCtx, auditID, "executed", "", dur); updErr != nil {
+				h.logger.Warn("audit outcome update failed", "err", updErr)
 			}
-			if logErr := h.store.LogAudit(ctx, e); logErr != nil {
-				h.logger.Warn("audit log failed", "err", logErr)
-			}
+			outDecision, outOutcome = "execute", "executed"
 			h.publishAuditAndQueue(agent.UserID, req.TaskID)
 
 			// Chain context extraction (async — cloud services only, guarded by verdict != nil)
@@ -1213,10 +1272,22 @@ func (h *GatewayHandler) HandleRequest(w http.ResponseWriter, r *http.Request) {
 	e := baseEntry("approve", "pending", taskIDPtr)
 	e.DurationMS = int(time.Since(start).Milliseconds())
 	e.Verification = intent.MarshalVerdict(advisoryVerdict)
-	if logErr := h.store.LogAudit(ctx, e); logErr != nil {
+	winner, logErr := h.logAuditCanonical(ctx, e)
+	if logErr != nil {
 		h.logger.Warn("audit log failed", "err", logErr)
 	}
 	h.publishAuditAndQueue(agent.UserID, req.TaskID)
+	if winner != nil {
+		// Same-scope race: another worker already enqueued the approval.
+		// Skip routeToApproval to avoid creating a duplicate pending row
+		// and surface the winner's outcome (which may itself still be
+		// "pending" — the agent should poll, not retry).
+		writeGatewayStatusResponse(w, winner, gatewayStatusResponseOptions{
+			Deduped: true,
+			Message: "Duplicate request_id reused; awaiting the existing approval. Use a new request_id for a new request.",
+		})
+		return
+	}
 	expiresAt := time.Now().Add(time.Duration(h.cfg.Approval.Timeout) * time.Second)
 	blob := buildRequestBlob(req, agent)
 	blob.Verification = advisoryVerdict
@@ -1230,15 +1301,16 @@ func (h *GatewayHandler) HandleRequest(w http.ResponseWriter, r *http.Request) {
 	}
 	// If wait=true, long-poll for approval then execute inline.
 	if r.URL.Query().Get("wait") == "true" && h.eventHub != nil {
-		pa := h.waitForApprovalDecision(r.Context(), req.RequestID, agent.UserID, longPollDeadline(r))
+		pa := h.waitForApprovalDecision(r.Context(), req.RequestID, agent.UserID, req.TaskID, longPollDeadline(r))
 		if pa != nil && pa.Status == "approved" && !time.Now().After(pa.ExpiresAt) {
 			h.executeAndRespond(w, r.Context(), pa, agent.ID)
 			return
 		}
-		// pa == nil means the row was deleted (denied/expired). Check the audit
-		// entry so we return the real outcome instead of a misleading "pending".
+		// pa == nil means the row was deleted (denied/expired). Look up the
+		// audit entry for the same task scope — request_id alone could pick up
+		// a sibling task's canonical under symmetric dedup.
 		if pa == nil {
-			if entry, err := h.store.GetAuditEntryByRequestID(r.Context(), req.RequestID, agent.UserID); err == nil && entry.Outcome != "pending" {
+			if entry, err := h.store.GetAuditEntryByRequestIDAndTask(r.Context(), req.RequestID, agent.UserID, req.TaskID); err == nil && entry.Outcome != "pending" {
 				writeGatewayStatusResponse(w, entry)
 				return
 			}
@@ -1275,7 +1347,12 @@ func (h *GatewayHandler) HandleGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	requestID := r.PathValue("request_id")
-	entry, err := h.store.GetAuditEntryByRequestID(r.Context(), requestID, agent.UserID)
+	// Optional ?task_id= scopes the lookup so an agent polling task A doesn't
+	// receive task B's newer canonical when both sides reused the same
+	// request_id under symmetric dedup. With no task_id the historical
+	// "latest canonical for this request_id" contract still applies.
+	taskID := r.URL.Query().Get("task_id")
+	entry, err := h.lookupAuditByRequestID(r.Context(), requestID, agent.UserID, taskID)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			writeError(w, http.StatusNotFound, "NOT_FOUND", "request not found")
@@ -1288,7 +1365,7 @@ func (h *GatewayHandler) HandleGet(w http.ResponseWriter, r *http.Request) {
 	// Long-poll: if wait=true and request is still pending, block until it
 	// transitions or the timeout elapses.
 	if r.URL.Query().Get("wait") == "true" && entry.Outcome == "pending" && h.eventHub != nil {
-		entry = h.waitForRequestResolution(r.Context(), requestID, agent.UserID, longPollDeadline(r))
+		entry = h.waitForRequestResolution(r.Context(), requestID, agent.UserID, taskID, longPollDeadline(r))
 		if r.Context().Err() != nil {
 			return
 		}
@@ -1297,13 +1374,28 @@ func (h *GatewayHandler) HandleGet(w http.ResponseWriter, r *http.Request) {
 	writeGatewayStatusResponse(w, entry)
 }
 
+// lookupAuditByRequestID returns the canonical audit entry for (request_id,
+// user_id), narrowing to the caller's task scope when taskID != "". The
+// task-scoped getter inverts FindDedupCandidate's precedence (exact-task
+// first, pre-task fallback) so a polling agent who knows its task_id always
+// gets the row that actually fired for that task — not a sibling task's
+// later canonical for the same request_id.
+func (h *GatewayHandler) lookupAuditByRequestID(ctx context.Context, requestID, userID, taskID string) (*store.AuditEntry, error) {
+	if taskID == "" {
+		return h.store.GetAuditEntryByRequestID(ctx, requestID, userID)
+	}
+	return h.store.GetAuditEntryByRequestIDAndTask(ctx, requestID, userID, taskID)
+}
+
 // waitForRequestResolution long-polls until the audit entry for a gateway
-// request leaves the "pending" state or the timeout expires.
-func (h *GatewayHandler) waitForRequestResolution(ctx context.Context, requestID, userID string, timeout time.Duration) *store.AuditEntry {
+// request leaves the "pending" state or the timeout expires. taskID is
+// forwarded to the lookup so a caller polling a specific task isn't woken
+// (or worse, returned) by a sibling task's canonical.
+func (h *GatewayHandler) waitForRequestResolution(ctx context.Context, requestID, userID, taskID string, timeout time.Duration) *store.AuditEntry {
 	return events.WaitFor(ctx, h.eventHub, userID, timeout,
 		[]string{"audit"},
 		func(c context.Context) (*store.AuditEntry, bool) {
-			e, err := h.store.GetAuditEntryByRequestID(c, requestID, userID)
+			e, err := h.lookupAuditByRequestID(c, requestID, userID, taskID)
 			if err != nil {
 				return &store.AuditEntry{RequestID: requestID, Outcome: "pending"}, false
 			}
@@ -1339,13 +1431,126 @@ func longPollDeadline(r *http.Request) time.Duration {
 	return time.Duration(parseLongPollTimeout(r))*time.Second + longPollGrace
 }
 
+// reserveExecAndWaitLoser inserts e as the canonical "execute"/"pending"
+// row that precedes the adapter call. Returns ok=true if the caller won
+// the canonical reservation and should proceed with the adapter; ok=false
+// if the caller lost the race and the deduped response has already been
+// written (caller must return).
+//
+// This is the only thing that prevents the auto-execute path from firing
+// non-idempotent adapter calls twice when two concurrent identical
+// requests both pass the early FindDedupCandidate gate at the top of
+// HandleRequest. Losers wait for the winner's canonical to leave
+// "pending" so the response reflects the actual outcome, not "pending".
+//
+// A reservation error (transient DB failure) returns ok=true with a warn
+// log — degrading to pre-PR best-effort behavior is better than failing
+// the request outright on a flaky write.
+func (h *GatewayHandler) reserveExecAndWaitLoser(w http.ResponseWriter, r *http.Request, e *store.AuditEntry) bool {
+	ctx := r.Context()
+	winner, reserveErr := h.logAuditCanonical(ctx, e)
+	if reserveErr != nil {
+		h.logger.Warn("audit reservation failed; proceeding without dedup protection", "err", reserveErr)
+	}
+	publishTaskID := ""
+	if e.TaskID != nil {
+		publishTaskID = *e.TaskID
+	}
+	h.publishAuditAndQueue(e.UserID, publishTaskID)
+	if winner == nil {
+		return true
+	}
+	final := winner
+	if winner.Outcome == "pending" && h.eventHub != nil {
+		if resolved := h.waitForRequestResolution(ctx, e.RequestID, e.UserID, publishTaskID, longPollDeadline(r)); resolved != nil {
+			final = resolved
+		}
+	}
+	writeGatewayStatusResponse(w, final, gatewayStatusResponseOptions{
+		Deduped: true,
+		Message: "Duplicate request_id reused; returning the existing result. Use a new request_id for a new request.",
+	})
+	return false
+}
+
+// logAuditCanonical writes a canonical audit row (DedupedOf == nil) and
+// recovers cleanly from a same-scope race. On a unique-violation against
+// idx_audit_canonical_dedup, it re-fetches the winning canonical via
+// FindDedupCandidate, demotes e in place to a dedup-attempt row pointing
+// at the winner, and re-LogAudits. Returns the winner (non-nil) iff race
+// recovery rewrote e; callers gating side effects or queue insertion on
+// canonical insertion should short-circuit on winner != nil with the
+// winner's outcome.
+//
+// Known limitation — auto-execute idempotency: callers that fire the
+// adapter BEFORE calling this helper can both miss the early
+// FindDedupCandidate check, both execute, and only collide here on the
+// audit insert. This helper recovers the audit shape (one canonical,
+// one dedup-attempt) but cannot un-fire a side effect the adapter
+// already executed. Closing the window requires an
+// insert-canonical-before-execute reservation pattern, intentionally
+// out of scope for the dedup-scope migration. The early
+// FindDedupCandidate at the request-handling entry still catches the
+// common case (sequential retries); the residual race is narrow (two
+// near-simultaneous identical requests). Even in that case, the
+// loser's response now reflects the winner's outcome and the loser's
+// callback is suppressed — the audit log is the only thing that no
+// longer "lies" about it.
+func (h *GatewayHandler) logAuditCanonical(ctx context.Context, e *store.AuditEntry) (*store.AuditEntry, error) {
+	err := h.store.LogAudit(ctx, e)
+	if err == nil || !errors.Is(err, store.ErrConflict) {
+		return nil, err
+	}
+	taskID := ""
+	if e.TaskID != nil {
+		taskID = *e.TaskID
+	}
+	winner, lookupErr := h.store.FindDedupCandidate(ctx, e.RequestID, e.UserID, taskID)
+	if lookupErr != nil {
+		return nil, fmt.Errorf("dedup candidate lookup after race: %w", lookupErr)
+	}
+	e.DedupedOf = &winner.ID
+	e.Decision = "dedup"
+	e.Outcome = winner.Outcome
+	return winner, h.store.LogAudit(ctx, e)
+}
+
+// writeAmbiguousExecute emits the 409 AMBIGUOUS response shape for the
+// agent-facing /execute endpoint when (request_id, user_id) matches more than
+// one pending approval. Mirrors writeAmbiguousPending on the user-facing
+// approvals path so clients see one consistent disambiguation contract.
+func (h *GatewayHandler) writeAmbiguousExecute(w http.ResponseWriter, ctx context.Context, requestID, userID string) {
+	candidates, err := h.store.ListPendingApprovalsByRequestID(ctx, requestID, userID)
+	if err != nil {
+		writeError(w, http.StatusConflict, "AMBIGUOUS", "multiple pending approvals share this request_id; retry with ?task_id=<id>")
+		return
+	}
+	taskIDs := make([]string, 0, len(candidates))
+	for _, c := range candidates {
+		t := ""
+		if c.TaskID != nil {
+			t = *c.TaskID
+		}
+		taskIDs = append(taskIDs, t)
+	}
+	writeJSON(w, http.StatusConflict, map[string]any{
+		"error":              "multiple pending approvals share this request_id",
+		"code":               "AMBIGUOUS",
+		"hint":               "retry with ?task_id=<one of candidate_task_ids>",
+		"request_id":         requestID,
+		"candidate_task_ids": taskIDs,
+	})
+}
+
 // waitForApprovalDecision long-polls until the pending approval leaves the
-// "pending" state (approved/denied/deleted) or the timeout expires.
-func (h *GatewayHandler) waitForApprovalDecision(ctx context.Context, requestID, userID string, timeout time.Duration) *store.PendingApproval {
+// "pending" state (approved/denied/deleted) or the timeout expires. The
+// taskID scope is required so two pending approvals sharing a request_id
+// under symmetric dedup don't cross-signal one another.
+func (h *GatewayHandler) waitForApprovalDecision(ctx context.Context, requestID, userID, taskID string, timeout time.Duration) *store.PendingApproval {
 	return events.WaitFor(ctx, h.eventHub, userID, timeout,
 		[]string{"audit", "queue"},
 		func(c context.Context) (*store.PendingApproval, bool) {
-			pa, err := h.store.GetPendingApproval(c, requestID)
+			pa, err := h.store.GetPendingApprovalByTask(c, requestID, userID, taskID)
 			if err != nil {
 				return nil, true // row deleted (denied/expired)
 			}
@@ -1361,7 +1566,11 @@ func (h *GatewayHandler) waitForApprovalDecision(ctx context.Context, requestID,
 func (h *GatewayHandler) executeAndRespond(w http.ResponseWriter, ctx context.Context, pa *store.PendingApproval, agentID string) {
 	// Atomic claim: only one caller wins. Prevents double-execution of
 	// non-idempotent actions (emails, payments, etc.).
-	claimed, claimErr := h.store.ClaimPendingApprovalForExecution(ctx, pa.RequestID)
+	paTask := ""
+	if pa.TaskID != nil {
+		paTask = *pa.TaskID
+	}
+	claimed, claimErr := h.store.ClaimPendingApprovalForExecution(ctx, pa.RequestID, pa.UserID, paTask)
 	if claimErr != nil {
 		writeError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "could not claim approval")
 		return
@@ -1407,7 +1616,7 @@ func (h *GatewayHandler) executeAndRespond(w http.ResponseWriter, ctx context.Co
 	}
 
 	_ = h.store.UpdateAuditOutcome(ctx, pa.AuditID, outcome, errMsg, dur)
-	_ = h.store.DeletePendingApproval(ctx, pa.RequestID)
+	_ = h.store.DeletePendingApproval(ctx, pa.RequestID, pa.UserID, paTask)
 	h.publishAuditAndQueue(pa.UserID, blob.TaskID)
 
 	resp := map[string]any{
@@ -1443,10 +1652,23 @@ func (h *GatewayHandler) HandleExecuteApproved(w http.ResponseWriter, r *http.Re
 	}
 
 	requestID := r.PathValue("request_id")
-	pa, err := h.store.GetPendingApproval(r.Context(), requestID)
+	// Optional ?task_id= disambiguates when the same request_id has more than
+	// one pending approval across tasks under symmetric dedup.
+	taskFromQuery := r.URL.Query().Get("task_id")
+	var pa *store.PendingApproval
+	var err error
+	if taskFromQuery != "" {
+		pa, err = h.store.GetPendingApprovalByTask(r.Context(), requestID, agent.UserID, taskFromQuery)
+	} else {
+		pa, err = h.store.GetPendingApproval(r.Context(), requestID, agent.UserID)
+	}
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			writeError(w, http.StatusNotFound, "NOT_FOUND", "pending approval not found")
+			return
+		}
+		if errors.Is(err, store.ErrAmbiguous) {
+			h.writeAmbiguousExecute(w, r.Context(), requestID, agent.UserID)
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "could not get pending approval")
@@ -1471,12 +1693,19 @@ func (h *GatewayHandler) HandleExecuteApproved(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	paTask := ""
+	if pa.TaskID != nil {
+		paTask = *pa.TaskID
+	}
+
 	// If still pending and wait=true, long-poll until approval decision.
 	if pa.Status == "pending" && r.URL.Query().Get("wait") == "true" && h.eventHub != nil {
-		pa = h.waitForApprovalDecision(r.Context(), requestID, agent.UserID, longPollDeadline(r))
+		pa = h.waitForApprovalDecision(r.Context(), requestID, agent.UserID, paTask, longPollDeadline(r))
 		if pa == nil {
-			// Row deleted (denied/expired) — check the audit entry for the real outcome.
-			if entry, err := h.store.GetAuditEntryByRequestID(r.Context(), requestID, agent.UserID); err == nil && entry.Outcome != "pending" {
+			// Row deleted (denied/expired). Scope the audit lookup to paTask so
+			// a sibling task's canonical for the same request_id doesn't shadow
+			// the real outcome.
+			if entry, err := h.store.GetAuditEntryByRequestIDAndTask(r.Context(), requestID, agent.UserID, paTask); err == nil && entry.Outcome != "pending" {
 				writeGatewayStatusResponse(w, entry)
 				return
 			}
@@ -2054,6 +2283,7 @@ func (h *GatewayHandler) routeToApproval(
 		ID:               uuid.New().String(),
 		UserID:           userID,
 		RequestID:        blob.RequestID,
+		TaskID:           taskID,
 		AuditID:          auditID,
 		ApprovalRecordID: &approvalRecord.ID,
 		RequestBlob:      json.RawMessage(blobBytes),
@@ -2074,12 +2304,20 @@ func (h *GatewayHandler) routeToApproval(
 	}
 
 	expiresIn := fmt.Sprintf("%d minutes", int(time.Until(expiresAt).Minutes()))
-	approveURL := fmt.Sprintf("%s/dashboard?action=approve&request_id=%s", h.baseURL, blob.RequestID)
-	denyURL := fmt.Sprintf("%s/dashboard?action=deny&request_id=%s", h.baseURL, blob.RequestID)
+	// task_id is included on the deep links so the dashboard can address the
+	// correct sibling when two pending approvals share a request_id across
+	// tasks under symmetric dedup.
+	taskQS := ""
+	if blob.TaskID != "" {
+		taskQS = "&task_id=" + blob.TaskID
+	}
+	approveURL := fmt.Sprintf("%s/dashboard?action=approve&request_id=%s%s", h.baseURL, blob.RequestID, taskQS)
+	denyURL := fmt.Sprintf("%s/dashboard?action=deny&request_id=%s%s", h.baseURL, blob.RequestID, taskQS)
 
 	approvalReq := notify.ApprovalRequest{
 		PendingID:    pa.ID,
 		RequestID:    blob.RequestID,
+		TaskID:       blob.TaskID,
 		UserID:       userID,
 		AgentName:    blob.AgentName,
 		Service:      blob.Service,
@@ -2102,8 +2340,21 @@ func (h *GatewayHandler) routeToApproval(
 		return nil
 	}
 
-	_ = h.store.SaveNotificationMessage(ctx, "approval", blob.RequestID, "telegram", msgID)
+	_ = h.store.SaveNotificationMessage(ctx, "approval", approvalNotifyTargetID(blob.RequestID, blob.TaskID), "telegram", msgID)
 	return nil
+}
+
+// approvalNotifyTargetID composes the notification_messages target_id for a
+// pending approval. Two sibling pendings can share request_id under symmetric
+// dedup; without task_id in the key, the second SendApprovalRequest would
+// overwrite the first message row, and the resolve path would later update
+// the wrong Telegram message. Pre-task approvals (taskID == "") keep their
+// historical request_id-only key so existing rows remain addressable.
+func approvalNotifyTargetID(requestID, taskID string) string {
+	if taskID == "" {
+		return requestID
+	}
+	return requestID + "|" + taskID
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

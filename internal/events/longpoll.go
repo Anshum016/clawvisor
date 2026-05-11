@@ -23,8 +23,27 @@ func WaitFor[T any](
 	ch, unsub := hub.Subscribe(userID)
 	defer unsub()
 
+	// Initial fetch after subscribe: if the state we're waiting on already
+	// resolved between the caller's last check and our Subscribe call, we'd
+	// otherwise block until timeout for an event that never arrives. The
+	// subscribe-then-check-then-wait order ensures any post-subscribe event
+	// still wakes us via ch even if the pre-subscribe one is missed.
+	if v, done := fetch(ctx); done {
+		return v
+	}
+
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
+
+	// Periodic poll: safety net for events the hub drops under buffer
+	// overflow (Publish skips full per-subscriber buffers). The
+	// initial-fetch above already covers publishes that landed between
+	// the caller's last check and our Subscribe call, so this only fires
+	// for the rare drop case. One second balances responsiveness against
+	// load (one fetch/sec per waiter) — under normal conditions
+	// nothing waits long enough for it to fire at all.
+	poll := time.NewTicker(1 * time.Second)
+	defer poll.Stop()
 
 	for {
 		select {
@@ -34,6 +53,10 @@ func WaitFor[T any](
 		case <-timer.C:
 			v, _ := fetch(context.Background())
 			return v
+		case <-poll.C:
+			if v, done := fetch(ctx); done {
+				return v
+			}
 		case evt, ok := <-ch:
 			if !ok {
 				v, _ := fetch(context.Background())

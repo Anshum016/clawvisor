@@ -1,6 +1,7 @@
 package api_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -10,8 +11,12 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/clawvisor/clawvisor/pkg/store"
+	vaultpkg "github.com/clawvisor/clawvisor/pkg/vault"
 )
 
 // registerCallbackSecret calls POST /api/callbacks/register and returns the secret.
@@ -203,6 +208,586 @@ func TestGateway_Dedup_SameRequestID_DifferentTask_NotDeduplicated(t *testing.T)
 	if second["result"] == nil {
 		t.Error("cross-task reuse: result should be present (not dedup cache)")
 	}
+}
+
+// TestGateway_Dedup_AfterCrossTaskReuse_RetryHitsOwnCanonical guards the
+// pre-LogAudit dedup check at gateway.go:264 against the cross-task-reuse
+// shadowing bug. Sequence: task A executes reqID=X, task B (different task)
+// executes reqID=X (independent canonical, allowed under symmetric scope),
+// task A retries reqID=X. The pre-LogAudit check must dedup to task A's
+// canonical, not task B's "latest" canonical — otherwise the retry falls
+// through, the side effect re-fires, and LogAudit hits the partial-unique
+// after the damage is done. FindDedupCandidate's same-task precedence is
+// the only thing that prevents that.
+func TestGateway_Dedup_AfterCrossTaskReuse_RetryHitsOwnCanonical(t *testing.T) {
+	adapter := newMockAdapter("mock.crosstask-retry", "run").withResult("ok", nil)
+	env := newTestEnv(t, adapter)
+	sc := newScenario(t, env, "crosstask-retry")
+	if err := env.Vault.Set(context.Background(), sc.session.UserID, "mock.crosstask-retry", []byte("cred")); err != nil {
+		t.Fatalf("vault seed: %v", err)
+	}
+
+	reqID := fmt.Sprintf("crosstask-retry-%s", randSuffix())
+
+	// Task A: auto-execute → canonical AC_A.
+	taskA := sc.createApprovedTask(t, env, "mock.crosstask-retry", "run", true)
+	first := sc.gatewayRequestWithTask(env, reqID, "mock.crosstask-retry", "run", taskA)
+	if first["status"] != "executed" {
+		t.Fatalf("task A first: expected executed, got %v", first["status"])
+	}
+	auditA := str(t, first, "audit_id")
+
+	// Task B (different task, different purpose): also auto-execute, same
+	// request_id. Under symmetric scope this lands its own canonical AC_B.
+	time.Sleep(10 * time.Millisecond) // content-dedup TTL separation
+	taskResp := env.do("POST", "/api/tasks", sc.AgentToken, map[string]any{
+		"purpose": "task B with different purpose",
+		"authorized_actions": []map[string]any{{
+			"service": "mock.crosstask-retry", "action": "run", "auto_execute": true,
+		}},
+	})
+	taskBody := mustStatus(t, taskResp, http.StatusCreated)
+	taskB := str(t, taskBody, "task_id")
+	taskResp = sc.session.do("POST", fmt.Sprintf("/api/tasks/%s/approve", taskB), nil)
+	mustStatus(t, taskResp, http.StatusOK)
+	second := sc.gatewayRequestWithTask(env, reqID, "mock.crosstask-retry", "run", taskB)
+	if second["status"] != "executed" {
+		t.Fatalf("task B: expected executed, got %v", second["status"])
+	}
+	auditB := str(t, second, "audit_id")
+	if auditA == auditB {
+		t.Fatalf("task B should have its own canonical, got same audit_id as task A: %q", auditA)
+	}
+
+	// Task A retries reqID=X. Must dedup to AC_A (its own canonical), NOT
+	// AC_B (the latest canonical for reqID=X). A request_id-only audit
+	// lookup at the dedup gate would return AC_B and the retry would fall
+	// through.
+	retry := sc.gatewayRequestWithTask(env, reqID, "mock.crosstask-retry", "run", taskA)
+	if retry["deduped"] != true {
+		t.Fatalf("task A retry: expected deduped=true, got %v (full response: %+v)", retry["deduped"], retry)
+	}
+	if got := str(t, retry, "audit_id"); got != auditA {
+		t.Fatalf("task A retry: should dedup to AC_A %q, got %q (AC_B was %q)", auditA, got, auditB)
+	}
+}
+
+// TestGateway_Dedup_SameRequestID_DifferentTask_ApprovalRequired_IndependentApprovals
+// pins the symmetric-dedup behavior change: when two tasks reuse the same
+// request_id and both fall under approval-required, each task gets its own
+// pending approval rather than the second being silently dedup'd to the first
+// task's approval.
+//
+// Before symmetric scoping, pending_approvals.UNIQUE(request_id) forced the
+// second insert to hit ErrConflict and the handler demoted the second audit
+// row to a dedup-attempt pointing at the first task's pending. The
+// user-visible effect was "two tasks share one approval queue entry," which
+// is incoherent with the auto-execute case where each task gets an
+// independent execution.
+//
+// After symmetric scoping, both inserts succeed under distinct
+// (user_id, request_id, task_id) keys, so the queue shows two entries and
+// denying one leaves the other pending.
+func TestGateway_Dedup_SameRequestID_DifferentTask_ApprovalRequired_IndependentApprovals(t *testing.T) {
+	env := newTestEnv(t, newMockAdapter("mock.crosstask-appr", "run"))
+	sc := newScenario(t, env, "crosstask-appr")
+
+	reqID := fmt.Sprintf("crosstask-appr-%s", randSuffix())
+
+	// First task: approval-required → first pending approval.
+	taskID1 := sc.createApprovedTask(t, env, "mock.crosstask-appr", "run", false)
+	first := sc.gatewayRequestWithTask(env, reqID, "mock.crosstask-appr", "run", taskID1)
+	if first["status"] != "pending" {
+		t.Fatalf("first request: expected pending, got %v", first["status"])
+	}
+	firstAuditID := str(t, first, "audit_id")
+
+	// Second task with a different purpose to avoid task-content dedup,
+	// same request_id, also approval-required.
+	taskResp := env.do("POST", "/api/tasks", sc.AgentToken, map[string]any{
+		"purpose": "second task with different purpose",
+		"authorized_actions": []map[string]any{{
+			"service": "mock.crosstask-appr", "action": "run", "auto_execute": false,
+		}},
+	})
+	taskBody := mustStatus(t, taskResp, http.StatusCreated)
+	taskID2 := str(t, taskBody, "task_id")
+	taskResp = sc.session.do("POST", fmt.Sprintf("/api/tasks/%s/approve", taskID2), nil)
+	mustStatus(t, taskResp, http.StatusOK)
+	second := sc.gatewayRequestWithTask(env, reqID, "mock.crosstask-appr", "run", taskID2)
+	if second["status"] != "pending" {
+		t.Fatalf("second request: expected pending, got %v", second["status"])
+	}
+	if second["deduped"] == true {
+		t.Errorf("cross-task approval-required: second request should NOT be dedup'd, got deduped=true")
+	}
+	secondAuditID := str(t, second, "audit_id")
+	if secondAuditID == firstAuditID {
+		t.Errorf("cross-task approval-required: expected fresh audit_id, got same as first")
+	}
+
+	// /api/approvals should list two distinct pending entries, both with our
+	// reqID, AND each must carry its task_id so the dashboard can resolve the
+	// specific sibling via ?task_id= without hitting AMBIGUOUS.
+	resp := sc.session.do("GET", "/api/approvals", nil)
+	apBody := mustStatus(t, resp, http.StatusOK)
+	gotTaskIDs := map[string]bool{}
+	for _, e := range arr(t, apBody, "entries") {
+		m := e.(map[string]any)
+		if m["request_id"] != reqID {
+			continue
+		}
+		taskID, ok := m["task_id"].(string)
+		if !ok || taskID == "" {
+			t.Fatalf("pending approval is missing task_id: %v", m)
+		}
+		gotTaskIDs[taskID] = true
+	}
+	if !gotTaskIDs[taskID1] || !gotTaskIDs[taskID2] {
+		t.Fatalf("expected pending entries for both tasks, got task_ids %v (want %q + %q)", gotTaskIDs, taskID1, taskID2)
+	}
+
+	// Dashboard-style disambiguated approve via ?task_id= resolves the
+	// specific sibling for each task.
+	resp = sc.session.do("POST", fmt.Sprintf("/api/approvals/%s/approve?task_id=%s", reqID, taskID1), nil)
+	mustStatus(t, resp, http.StatusOK)
+	resp = sc.session.do("POST", fmt.Sprintf("/api/approvals/%s/deny?task_id=%s", reqID, taskID2), nil)
+	mustStatus(t, resp, http.StatusOK)
+}
+
+// TestGateway_Dedup_ConcurrentSameScope_RecoversCanonical guards the
+// same-scope race recovery: two concurrent identical requests must end with
+// exactly one canonical audit row and the loser's response must reflect the
+// winner's outcome (deduped:true, same audit_id) instead of a fresh
+// executed row whose canonical insert silently failed. Pre-fix this test
+// would either see two canonical rows (impossible under the unique index)
+// or one canonical + one orphan loser whose LogAudit silently logged and
+// fell through to a regular "executed" response, leaving the agent unaware
+// of the dedup.
+//
+// This test only locks in the audit-shape + response-shape recovery; see
+// TestGateway_Dedup_ConcurrentSameScope_DoesNotDoubleExecuteAdapter for the
+// stronger idempotency expectation.
+func TestGateway_Dedup_ConcurrentSameScope_RecoversCanonical(t *testing.T) {
+	adapter := newMockAdapter("mock.race-recover", "run").withResult("ok", nil)
+	env := newTestEnv(t, adapter)
+	sc := newScenario(t, env, "race-recover")
+	if err := env.Vault.Set(context.Background(), sc.session.UserID, "mock.race-recover", []byte("cred")); err != nil {
+		t.Fatalf("vault seed: %v", err)
+	}
+	taskID := sc.createApprovedTask(t, env, "mock.race-recover", "run", true)
+	reqID := fmt.Sprintf("race-recover-%s", randSuffix())
+
+	const goroutines = 8
+	var (
+		wg      sync.WaitGroup
+		results = make([]map[string]any, goroutines)
+		start   = make(chan struct{})
+	)
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			<-start
+			results[idx] = sc.gatewayRequestWithTask(env, reqID, "mock.race-recover", "run", taskID)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	// Exactly one canonical audit row should exist for (user, reqID, task).
+	// All N callers must return the SAME audit_id; N-1 must report deduped:true.
+	auditIDs := map[string]int{}
+	dedupCount := 0
+	for _, r := range results {
+		if r == nil {
+			t.Fatal("nil result")
+		}
+		if r["status"] != "executed" {
+			t.Fatalf("expected status=executed, got %v (full: %+v)", r["status"], r)
+		}
+		auditIDs[str(t, r, "audit_id")]++
+		if r["deduped"] == true {
+			dedupCount++
+		}
+	}
+	if len(auditIDs) != 1 {
+		t.Fatalf("expected all %d racers to converge on a single canonical audit_id, got %d distinct: %v", goroutines, len(auditIDs), auditIDs)
+	}
+	if dedupCount != goroutines-1 {
+		t.Fatalf("expected %d racers to report deduped=true, got %d", goroutines-1, dedupCount)
+	}
+}
+
+func TestGateway_Dedup_ConcurrentSameScope_DoesNotDoubleExecuteAdapter(t *testing.T) {
+	firstExecute := make(chan struct{}, 1)
+	releaseExecute := make(chan struct{})
+	adapter := newMockAdapter("mock.race-idempotent", "run").
+		withResult("ok", nil).
+		withExecuteHook(func() {
+			select {
+			case firstExecute <- struct{}{}:
+			default:
+			}
+			<-releaseExecute
+		})
+	env := newTestEnv(t, adapter)
+	sc := newScenario(t, env, "race-idempotent")
+	if err := env.Vault.Set(context.Background(), sc.session.UserID, "mock.race-idempotent", []byte("cred")); err != nil {
+		t.Fatalf("vault seed: %v", err)
+	}
+	taskID := sc.createApprovedTask(t, env, "mock.race-idempotent", "run", true)
+	reqID := fmt.Sprintf("race-idempotent-%s", randSuffix())
+
+	const goroutines = 8
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	results := make([]map[string]any, goroutines)
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			<-start
+			results[idx] = sc.gatewayRequestWithTask(env, reqID, "mock.race-idempotent", "run", taskID)
+		}(i)
+	}
+	close(start)
+
+	select {
+	case <-firstExecute:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for first adapter execution")
+	}
+	// No fixed sleep before releasing: every loser converges to
+	// status="executed" regardless of where it arrives in the race —
+	// reservation-conflict + reserveExecAndWaitLoser, early-dedup on the
+	// in-flight reservation + wait there, or early-dedup after
+	// UpdateAuditOutcome and immediate return. The two invariants
+	// (executeCount == 1 and every result is "executed") hold across
+	// all three paths, so a fixed sleep would only add flakiness without
+	// strengthening the assertion.
+	close(releaseExecute)
+	wg.Wait()
+
+	for _, r := range results {
+		if r == nil {
+			t.Fatal("nil result")
+		}
+		if r["status"] != "executed" {
+			t.Fatalf("expected status=executed, got %v (full: %+v)", r["status"], r)
+		}
+	}
+	if got := adapter.executeCount(); got != 1 {
+		t.Fatalf("duplicate request_id should execute adapter once, got %d executions", got)
+	}
+}
+
+func TestGateway_Dedup_CanceledClientStillFinalizesExecuteReservation(t *testing.T) {
+	firstExecute := make(chan struct{}, 1)
+	releaseExecute := make(chan struct{})
+	adapter := newMockAdapter("mock.cancel-finalize", "run").
+		withResult("ok", nil).
+		withExecuteHook(func() {
+			select {
+			case firstExecute <- struct{}{}:
+			default:
+			}
+			<-releaseExecute
+		})
+	env := newTestEnv(t, adapter)
+	sc := newScenario(t, env, "cancel-finalize")
+	if err := env.Vault.Set(context.Background(), sc.session.UserID, "mock.cancel-finalize", []byte("cred")); err != nil {
+		t.Fatalf("vault seed: %v", err)
+	}
+	taskID := sc.createApprovedTask(t, env, "mock.cancel-finalize", "run", true)
+	reqID := fmt.Sprintf("cancel-finalize-%s", randSuffix())
+
+	body, err := json.Marshal(map[string]any{
+		"request_id": reqID,
+		"service":    "mock.cancel-finalize",
+		"action":     "run",
+		"task_id":    taskID,
+		"reason":     "exercise canceled client finalization",
+	})
+	if err != nil {
+		t.Fatalf("marshal body: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, env.url("/api/gateway/request"), bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+sc.AgentToken)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		env.ts.Config.Handler.ServeHTTP(httptest.NewRecorder(), req)
+	}()
+
+	select {
+	case <-firstExecute:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for adapter execution")
+	}
+	cancel()
+	close(releaseExecute)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for canceled client request to return")
+	}
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	var last *store.AuditEntry
+	for {
+		entry, err := env.Store.GetAuditEntryByRequestIDAndTask(context.Background(), reqID, sc.session.UserID, taskID)
+		if err == nil {
+			last = entry
+			if entry.Outcome == "executed" {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			if last == nil {
+				t.Fatalf("expected terminal audit row for canceled request, lookup did not succeed")
+			}
+			t.Fatalf("expected canceled request reservation to finalize as executed, got decision=%q outcome=%q audit_id=%s", last.Decision, last.Outcome, last.ID)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestGateway_Dedup_CanceledClientStillFinalizesMissingCredentialReservation(t *testing.T) {
+	vaultGate := &blockingMissingCredentialVault{
+		serviceID: "mock.cancel-missing-cred",
+		entered:   make(chan struct{}, 1),
+		release:   make(chan struct{}),
+	}
+	adapter := newMockAdapter("mock.cancel-missing-cred", "run").withResult("ok", nil)
+	env := newTestEnvWithVaultWrapper(t, func(v vaultpkg.Vault) vaultpkg.Vault {
+		vaultGate.Vault = v
+		return vaultGate
+	}, adapter)
+	sc := newScenario(t, env, "cancel-missing-cred")
+	vaultGate.enabled = false
+	sc.activateService(t, env, "mock.cancel-missing-cred")
+
+	// Create and approve the task while the service is activated, then remove
+	// the credential. The gateway reserves execute/pending before it discovers
+	// vault.ErrNotFound during the adapter execution path.
+	resp := env.do("POST", "/api/tasks", sc.AgentToken, map[string]any{
+		"purpose": "test missing credential finalization",
+		"authorized_actions": []map[string]any{{
+			"service": "mock.cancel-missing-cred", "action": "run", "auto_execute": true,
+		}},
+	})
+	body := mustStatus(t, resp, http.StatusCreated)
+	taskID := str(t, body, "task_id")
+	resp = sc.session.do("POST", fmt.Sprintf("/api/tasks/%s/approve", taskID), nil)
+	mustStatus(t, resp, http.StatusOK)
+	if err := env.Vault.Delete(context.Background(), sc.session.UserID, "mock.cancel-missing-cred"); err != nil {
+		t.Fatalf("vault delete: %v", err)
+	}
+	vaultGate.enabled = true
+
+	reqID := fmt.Sprintf("cancel-missing-cred-%s", randSuffix())
+	reqBody, err := json.Marshal(map[string]any{
+		"request_id": reqID,
+		"service":    "mock.cancel-missing-cred",
+		"action":     "run",
+		"task_id":    taskID,
+		"reason":     "exercise canceled client missing credential finalization",
+	})
+	if err != nil {
+		t.Fatalf("marshal body: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, env.url("/api/gateway/request"), bytes.NewReader(reqBody))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+sc.AgentToken)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		env.ts.Config.Handler.ServeHTTP(httptest.NewRecorder(), req)
+	}()
+
+	select {
+	case <-vaultGate.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for gateway credential lookup")
+	}
+	cancel()
+	close(vaultGate.release)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for canceled client request to return")
+	}
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	var last *store.AuditEntry
+	for {
+		entry, err := env.Store.GetAuditEntryByRequestIDAndTask(context.Background(), reqID, sc.session.UserID, taskID)
+		if err == nil {
+			last = entry
+			if entry.Outcome == "error" {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			if last == nil {
+				t.Fatalf("expected terminal audit row for canceled missing-credential request, lookup did not succeed")
+			}
+			t.Fatalf("expected canceled missing-credential reservation to finalize as error, got decision=%q outcome=%q audit_id=%s", last.Decision, last.Outcome, last.ID)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+type blockingMissingCredentialVault struct {
+	vaultpkg.Vault
+	serviceID string
+	enabled   bool
+	entered   chan struct{}
+	release   chan struct{}
+}
+
+func (v *blockingMissingCredentialVault) Get(ctx context.Context, userID, serviceID string) ([]byte, error) {
+	if v.enabled && serviceID == v.serviceID {
+		select {
+		case v.entered <- struct{}{}:
+		default:
+		}
+		<-v.release
+		return nil, vaultpkg.ErrNotFound
+	}
+	return v.Vault.Get(ctx, userID, serviceID)
+}
+
+// TestGateway_Status_TaskScoped guards the status / long-poll endpoint
+// against sibling-task shadowing. Under symmetric dedup, two tasks can land
+// distinct canonicals for the same request_id; the polling endpoint must
+// return the row that matches the caller's task_id when supplied, not just
+// "latest canonical for this request_id".
+func TestGateway_Status_TaskScoped(t *testing.T) {
+	adapter := newMockAdapter("mock.status-task", "run").withResult("ok", nil)
+	env := newTestEnv(t, adapter)
+	sc := newScenario(t, env, "status-task")
+	if err := env.Vault.Set(context.Background(), sc.session.UserID, "mock.status-task", []byte("cred")); err != nil {
+		t.Fatalf("vault seed: %v", err)
+	}
+
+	reqID := fmt.Sprintf("status-task-%s", randSuffix())
+
+	taskA := sc.createApprovedTask(t, env, "mock.status-task", "run", true)
+	first := sc.gatewayRequestWithTask(env, reqID, "mock.status-task", "run", taskA)
+	if first["status"] != "executed" {
+		t.Fatalf("task A: expected executed, got %v", first["status"])
+	}
+	auditA := str(t, first, "audit_id")
+
+	// Task B also executes the same request_id (independent canonical under
+	// symmetric scope). With ?task_id= each task's poll must resolve to that
+	// task's own canonical, not whichever happens to be "latest". SQLite
+	// stores audit timestamps at second granularity, so "latest" is unstable
+	// for nearly-simultaneous rows — only the task-scoped contract is
+	// deterministic enough to assert here.
+	taskResp := env.do("POST", "/api/tasks", sc.AgentToken, map[string]any{
+		"purpose": "task B status scope",
+		"authorized_actions": []map[string]any{{
+			"service": "mock.status-task", "action": "run", "auto_execute": true,
+		}},
+	})
+	taskBody := mustStatus(t, taskResp, http.StatusCreated)
+	taskB := str(t, taskBody, "task_id")
+	taskResp = sc.session.do("POST", fmt.Sprintf("/api/tasks/%s/approve", taskB), nil)
+	mustStatus(t, taskResp, http.StatusOK)
+	second := sc.gatewayRequestWithTask(env, reqID, "mock.status-task", "run", taskB)
+	if second["status"] != "executed" {
+		t.Fatalf("task B: expected executed, got %v", second["status"])
+	}
+	auditB := str(t, second, "audit_id")
+	if auditA == auditB {
+		t.Fatalf("expected distinct canonicals for two tasks, got same audit_id %q", auditA)
+	}
+
+	// Task-scoped status returns each task's own row regardless of which is
+	// "newer" under second-granularity timestamps.
+	resp := env.do("GET", fmt.Sprintf("/api/gateway/request/%s?task_id=%s", reqID, taskA), sc.AgentToken, nil)
+	got := mustStatus(t, resp, http.StatusOK)
+	if got["audit_id"] != auditA {
+		t.Fatalf("task-scoped status (A): expected %q, got %q", auditA, got["audit_id"])
+	}
+	resp = env.do("GET", fmt.Sprintf("/api/gateway/request/%s?task_id=%s", reqID, taskB), sc.AgentToken, nil)
+	got = mustStatus(t, resp, http.StatusOK)
+	if got["audit_id"] != auditB {
+		t.Fatalf("task-scoped status (B): expected %q, got %q", auditB, got["audit_id"])
+	}
+}
+
+// TestApprovals_Ambiguous_Returns409 covers the AMBIGUOUS disambiguation
+// contract for the request_id-only HTTP routes. Two pending approvals share
+// the same request_id (because they belong to different tasks); approving by
+// request_id alone must surface 409 AMBIGUOUS with candidate_task_ids, and
+// providing ?task_id= must resolve the correct row.
+func TestApprovals_Ambiguous_Returns409(t *testing.T) {
+	env := newTestEnv(t, newMockAdapter("mock.ambiguous", "run"))
+	sc := newScenario(t, env, "ambiguous")
+
+	reqID := fmt.Sprintf("ambig-%s", randSuffix())
+
+	taskID1 := sc.createApprovedTask(t, env, "mock.ambiguous", "run", false)
+	first := sc.gatewayRequestWithTask(env, reqID, "mock.ambiguous", "run", taskID1)
+	if first["status"] != "pending" {
+		t.Fatalf("first request: expected pending, got %v", first["status"])
+	}
+
+	taskResp := env.do("POST", "/api/tasks", sc.AgentToken, map[string]any{
+		"purpose": "second task ambiguous test",
+		"authorized_actions": []map[string]any{{
+			"service": "mock.ambiguous", "action": "run", "auto_execute": false,
+		}},
+	})
+	taskBody := mustStatus(t, taskResp, http.StatusCreated)
+	taskID2 := str(t, taskBody, "task_id")
+	taskResp = sc.session.do("POST", fmt.Sprintf("/api/tasks/%s/approve", taskID2), nil)
+	mustStatus(t, taskResp, http.StatusOK)
+	second := sc.gatewayRequestWithTask(env, reqID, "mock.ambiguous", "run", taskID2)
+	if second["status"] != "pending" {
+		t.Fatalf("second request: expected pending, got %v", second["status"])
+	}
+
+	// request_id-only approve hits 409 AMBIGUOUS with candidate task_ids.
+	resp := sc.session.do("POST", fmt.Sprintf("/api/approvals/%s/approve", reqID), nil)
+	body := mustStatus(t, resp, http.StatusConflict)
+	if body["code"] != "AMBIGUOUS" {
+		t.Fatalf("expected code=AMBIGUOUS, got %v", body["code"])
+	}
+	candidates := arr(t, body, "candidate_task_ids")
+	if len(candidates) != 2 {
+		t.Fatalf("expected 2 candidate_task_ids, got %d", len(candidates))
+	}
+	gotTasks := map[string]bool{}
+	for _, c := range candidates {
+		gotTasks[c.(string)] = true
+	}
+	if !gotTasks[taskID1] || !gotTasks[taskID2] {
+		t.Fatalf("candidate_task_ids missing one of %q/%q, got %v", taskID1, taskID2, candidates)
+	}
+
+	// Disambiguated approve via ?task_id= resolves the right row.
+	resp = sc.session.do("POST", fmt.Sprintf("/api/approvals/%s/approve?task_id=%s", reqID, taskID1), nil)
+	mustStatus(t, resp, http.StatusOK)
+
+	// The other pending approval is still there; approve it explicitly.
+	resp = sc.session.do("POST", fmt.Sprintf("/api/approvals/%s/approve?task_id=%s", reqID, taskID2), nil)
+	mustStatus(t, resp, http.StatusOK)
 }
 
 // ── GET /api/gateway/request/{request_id} ────────────────────────────────────
