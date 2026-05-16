@@ -71,28 +71,16 @@ You'll configure three sections: **Branding**, **Audience**, and **Data Access**
 
 ## 5. Configure Clawvisor
 
-If you ran `make setup` and said **Yes** to Google services, the setup wizard
-already prompted you for these values — you can skip this step.
-
-Otherwise, set the credentials as environment variables before starting the server:
+Set the credentials as environment variables before starting the server:
 
 ```bash
 export GOOGLE_CLIENT_ID="your-client-id.apps.googleusercontent.com"
 export GOOGLE_CLIENT_SECRET="your-client-secret"
 ```
 
-Or add them to your `config.yaml`:
-
-```yaml
-services:
-  google:
-    client_id: "your-client-id.apps.googleusercontent.com"
-    client_secret: "your-client-secret"
-```
-
 ## 6. Connect your account
 
-1. Start Clawvisor: `make run`
+1. Start Clawvisor: `CONFIG_FILE="$HOME/.clawvisor/config.yaml" make run`
 2. Open the dashboard and go to **Services**
 3. Click **Connect** next to Google
 4. You'll be redirected to Google's consent screen — authorize with your account
