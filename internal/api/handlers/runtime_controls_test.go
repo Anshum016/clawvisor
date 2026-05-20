@@ -437,7 +437,40 @@ func TestDefaultToolRulesSeedAndRespectUnset(t *testing.T) {
 	}
 
 	h := NewLLMEndpointHandler(st, nil, nil)
-	h.ensureDefaultToolRules(ctx, agent, []string{"Read", "read_file", "Bash", "Write"})
+	h.ensureDefaultToolRules(ctx, agent, []string{
+		"Read",
+		"read_file",
+		"Bash",
+		"Write",
+		"sessions_list",
+		"sessions_history",
+		"session_status",
+		"sessions_yield",
+		"memory_search",
+		"memory_get",
+		"exec",
+		"process",
+		"web_fetch",
+		"sessions_send",
+		"sessions_spawn",
+		"subagents",
+		"search_files",
+		"session_search",
+		"skills_list",
+		"skill_view",
+		"clarify",
+		"browser_snapshot",
+		"browser_console",
+		"browser_get_images",
+		"terminal",
+		"write_file",
+		"patch",
+		"browser_navigate",
+		"browser_click",
+		"browser_type",
+		"browser_vision",
+		"delegate_task",
+	})
 	enabled := true
 	rules, err := st.ListRuntimePolicyRules(ctx, user.ID, store.RuntimePolicyRuleFilter{AgentID: agent.ID, Kind: "tool", Enabled: &enabled})
 	if err != nil {
@@ -450,10 +483,21 @@ func TestDefaultToolRulesSeedAndRespectUnset(t *testing.T) {
 			t.Fatalf("default tool rule should be agent-scoped, got %+v", rule)
 		}
 	}
-	if !allowed["Read"] || !allowed["read_file"] {
+	if !allowed["Read"] || !allowed["read_file"] ||
+		!allowed["sessions_list"] || !allowed["sessions_history"] ||
+		!allowed["session_status"] || !allowed["sessions_yield"] ||
+		!allowed["memory_search"] || !allowed["memory_get"] ||
+		!allowed["search_files"] || !allowed["session_search"] ||
+		!allowed["skills_list"] || !allowed["skill_view"] ||
+		!allowed["clarify"] || !allowed["browser_snapshot"] ||
+		!allowed["browser_console"] || !allowed["browser_get_images"] {
 		t.Fatalf("expected discovered default tools to be seeded as always allow, got %+v", rules)
 	}
-	if allowed["Bash"] || allowed["Write"] {
+	if allowed["Bash"] || allowed["Write"] || allowed["exec"] || allowed["process"] ||
+		allowed["web_fetch"] || allowed["sessions_send"] || allowed["sessions_spawn"] ||
+		allowed["subagents"] || allowed["terminal"] || allowed["write_file"] ||
+		allowed["patch"] || allowed["browser_navigate"] || allowed["browser_click"] ||
+		allowed["browser_type"] || allowed["browser_vision"] || allowed["delegate_task"] {
 		t.Fatalf("non-default tools should not be seeded as always allow, got %+v", rules)
 	}
 

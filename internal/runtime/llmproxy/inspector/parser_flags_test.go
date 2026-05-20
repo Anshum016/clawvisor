@@ -224,6 +224,86 @@ func TestParseBashCurl_AcceptsLineContinuationBeforeHeader(t *testing.T) {
 	}
 }
 
+func TestOpenClawReadOnlyToolsAreLocalOnlyDefaults(t *testing.T) {
+	for _, name := range []string{
+		"memory_get",
+		"memory_search",
+		"session_status",
+		"sessions_history",
+		"sessions_list",
+		"sessions_yield",
+	} {
+		if !IsLocalOnlyTool(name) {
+			t.Fatalf("%s should be treated as local-only", name)
+		}
+		if !IsDefaultAllowedTool(name) {
+			t.Fatalf("%s should be seeded as a default allowed tool", name)
+		}
+	}
+	for _, name := range []string{
+		"edit",
+		"exec",
+		"image",
+		"process",
+		"sessions_send",
+		"sessions_spawn",
+		"subagents",
+		"web_fetch",
+		"write",
+	} {
+		if IsDefaultAllowedTool(name) {
+			t.Fatalf("%s should not be seeded as a default allowed tool", name)
+		}
+	}
+}
+
+func TestHermesReadOnlyToolsAreLocalOnlyDefaults(t *testing.T) {
+	for _, name := range []string{
+		"browser_console",
+		"browser_get_images",
+		"browser_snapshot",
+		"clarify",
+		"read_file",
+		"search_files",
+		"session_search",
+		"skill_view",
+		"skills_list",
+	} {
+		if !IsLocalOnlyTool(name) {
+			t.Fatalf("%s should be treated as local-only", name)
+		}
+		if !IsDefaultAllowedTool(name) {
+			t.Fatalf("%s should be seeded as a default allowed tool", name)
+		}
+	}
+	for _, name := range []string{
+		"browser_back",
+		"browser_click",
+		"browser_navigate",
+		"browser_press",
+		"browser_scroll",
+		"browser_type",
+		"browser_vision",
+		"cronjob",
+		"delegate_task",
+		"execute_code",
+		"image_generate",
+		"memory",
+		"patch",
+		"process",
+		"send_message",
+		"skill_manage",
+		"terminal",
+		"text_to_speech",
+		"vision_analyze",
+		"write_file",
+	} {
+		if IsDefaultAllowedTool(name) {
+			t.Fatalf("%s should not be seeded as a default allowed tool", name)
+		}
+	}
+}
+
 // Regression: a placeholder substring inside a local-only tool's args
 // (Skill, Read, Edit, etc.) must pass through without engaging the
 // LLM validator. Otherwise smoke-test installs without an LLM-backed
@@ -241,6 +321,8 @@ func TestParser_LocalOnlyToolsPassThrough(t *testing.T) {
 		{"glob_with_placeholder_pattern", "Glob", `{"pattern":"autovault_github_xxx*.json"}`},
 		// Codex's read_file is treated the same as Claude Code's Read.
 		{"codex_read_file", "read_file", `{"path":"/tmp/autovault_github_xxx.json"}`},
+		// OpenClaw's read tool is lowercase but should be treated as a local file read.
+		{"openclaw_read", "read", `{"path":"/tmp/autovault_github_xxx.json"}`},
 		{"ask_user_question", "AskUserQuestion", `{"question":"Use autovault_github_xxx for this task?","options":["yes","no"]}`},
 	}
 	for _, tc := range cases {
