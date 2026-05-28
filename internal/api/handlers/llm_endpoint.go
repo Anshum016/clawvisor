@@ -20,6 +20,7 @@ import (
 	"github.com/clawvisor/clawvisor/internal/runtime/conversation"
 	"github.com/clawvisor/clawvisor/internal/runtime/llmproxy"
 	"github.com/clawvisor/clawvisor/internal/runtime/llmproxy/inspector"
+	"github.com/clawvisor/clawvisor/internal/runtime/llmproxy/pricing"
 	"github.com/clawvisor/clawvisor/internal/taskrisk"
 	runtimedecision "github.com/clawvisor/clawvisor/pkg/runtime/decision"
 	"github.com/clawvisor/clawvisor/pkg/store"
@@ -232,6 +233,11 @@ func (h *LLMEndpointHandler) serve(w http.ResponseWriter, r *http.Request) {
 		auditOutcome string
 		auditReason  string
 		auditParams  map[string]any
+		// Cost-extraction state populated once the upstream response
+		// has been buffered. The deferred audit emission below reads
+		// these to write a paired llm_request_cost row.
+		auditUsage   *llmproxy.ExtractUsageResult
+		auditTaskID  string
 	)
 	defer func() {
 		// One-liner summary at handler exit — visible in slog even
@@ -266,7 +272,8 @@ func (h *LLMEndpointHandler) serve(w http.ResponseWriter, r *http.Request) {
 		// stalls invisible until we added the raw I/O log).
 		h.AuditEmitter.LogEndpointCall(context.Background(), auditAgent, requestID, provName,
 			auditAction, auditStatus, auditDecide, auditOutcome, auditReason,
-			time.Since(start), auditParams)
+			time.Since(start), auditParams,
+			llmproxy.EndpointCallExtras{TaskID: auditTaskID, Usage: auditUsage})
 	}()
 
 	agent := middleware.AgentFromContext(r.Context())
@@ -779,6 +786,27 @@ func (h *LLMEndpointHandler) serve(w http.ResponseWriter, r *http.Request) {
 		auditParams["upstream_body_bytes"] = bytesRead
 		auditParams["upstream_read_ms"] = readElapsed.Milliseconds()
 		auditParams["upstream_ttfb_body_ms"] = readTTFB.Milliseconds()
+		// Extract token usage on success (skip 4xx/5xx — they have no
+		// token-bearing body). The deferred audit emit at the top of
+		// serve() reads auditUsage / auditTaskID and writes one
+		// llm_request_cost row when usage is found. Cost is best-
+		// effort observability and never blocks the response. The
+		// task-id link is filled in below, once preferredTaskID has
+		// been resolved.
+		if readErr == nil && resp.StatusCode < 400 {
+			if usage := llmproxy.ExtractUsage(provider, upstreamCT, full, reqSummary.Model); usage.Found {
+				u := usage
+				auditUsage = &u
+				auditParams["usage_input_tokens"] = usage.Usage.InputTokens
+				auditParams["usage_output_tokens"] = usage.Usage.OutputTokens
+				if usage.Usage.CacheReadTokens > 0 {
+					auditParams["usage_cache_read_tokens"] = usage.Usage.CacheReadTokens
+				}
+				if usage.Usage.CacheWriteTokens > 0 {
+					auditParams["usage_cache_write_tokens"] = usage.Usage.CacheWriteTokens
+				}
+			}
+		}
 		if readErr != nil {
 			clientCancelled := r.Context().Err() != nil
 			h.Logger.WarnContext(context.Background(), "lite-proxy upstream read error",
@@ -879,6 +907,9 @@ func (h *LLMEndpointHandler) serve(w http.ResponseWriter, r *http.Request) {
 			auditParams["task_checkout_unavailable"] = true
 			preferredTaskID = ""
 		}
+		if preferredTaskID != "" {
+			auditTaskID = preferredTaskID
+		}
 		h.Logger.DebugContext(r.Context(), "lite-proxy decision inputs loaded",
 			"request_id", requestID,
 			"agent_id", agent.ID,
@@ -958,7 +989,7 @@ func (h *LLMEndpointHandler) serve(w http.ResponseWriter, r *http.Request) {
 		// original `processed` (which still carries SubstituteWith as a
 		// terminal assistant text), so the harness never sees an empty body.
 		{
-			contFinal, contStatus, contCT, contErr := h.tryContinuation(r, agent, provider, requestID, body, full, upstreamCT, resp.StatusCode, processed, llmproxy.PostprocessConfig{
+			contFinal, contStatus, contCT, contUsage, contErr := h.tryContinuation(r, agent, provider, requestID, body, full, upstreamCT, resp.StatusCode, processed, llmproxy.PostprocessConfig{
 				Inspector:                        h.Inspector,
 				RewriteOpts:                      opts,
 				Store:                            h.Store,
@@ -1019,6 +1050,57 @@ func (h *LLMEndpointHandler) serve(w http.ResponseWriter, r *http.Request) {
 				}
 				if contCT != "" && contCT != upstreamCT {
 					w.Header().Set("Content-Type", contCT)
+				}
+				// Reattribute the cost row ONLY when no prior task
+				// attribution exists. The auto-approve gate in the
+				// first postprocess pass minted a new task
+				// (Verdict.CreatedTaskID) and the continuation does
+				// THAT task's work, so when the conversation had no
+				// checkout yet (first turn) the cost belongs there
+				// rather than on NULL. But when the user already had
+				// a task checked out for this conversation,
+				// preferredTaskID populated auditTaskID earlier — a
+				// real, specific attribution we should preserve
+				// rather than overwrite with the just-minted task.
+				if auditTaskID == "" {
+					for _, dec := range processed.Decisions {
+						if dec.Verdict.ContinueWithToolResult != "" && dec.Verdict.CreatedTaskID != "" {
+							auditTaskID = dec.Verdict.CreatedTaskID
+							break
+						}
+					}
+				}
+				// Roll the continuation's tokens into the per-request
+				// cost. We expect both calls to report the same
+				// model (BuildContinuationBody preserves the inbound
+				// `model` field), so summing token buckets is safe
+				// and pricing.Compute will price the combined sum
+				// against one model row. Defend against a future
+				// regression where the upstream resolves to a
+				// different model on the continuation: drop the
+				// continuation's usage rather than silently bill it
+				// at the first call's rate.
+				if contUsage != nil {
+					switch {
+					case auditUsage == nil:
+						auditUsage = contUsage
+						auditParams["continuation_usage_recorded"] = true
+					case pricingModelMatch(auditUsage.Model, contUsage.Model):
+						auditUsage.Usage.InputTokens += contUsage.Usage.InputTokens
+						auditUsage.Usage.OutputTokens += contUsage.Usage.OutputTokens
+						auditUsage.Usage.CacheReadTokens += contUsage.Usage.CacheReadTokens
+						auditUsage.Usage.CacheWriteTokens += contUsage.Usage.CacheWriteTokens
+						auditUsage.Usage.CacheWrite1hTokens += contUsage.Usage.CacheWrite1hTokens
+						auditParams["continuation_usage_recorded"] = true
+					default:
+						h.Logger.WarnContext(r.Context(), "lite-proxy continuation usage dropped: model mismatch with original call",
+							"request_id", requestID,
+							"agent_id", agent.ID,
+							"original_model", auditUsage.Model,
+							"continuation_model", contUsage.Model,
+						)
+						auditParams["continuation_usage_dropped_model_mismatch"] = true
+					}
 				}
 			}
 		}
@@ -1281,13 +1363,13 @@ func (h *LLMEndpointHandler) tryContinuation(
 	upstreamStatus int,
 	processed llmproxy.PostprocessResult,
 	cfg llmproxy.PostprocessConfig,
-) (*llmproxy.PostprocessResult, int, string, error) {
+) (*llmproxy.PostprocessResult, int, string, *llmproxy.ExtractUsageResult, error) {
 	if upstreamStatus >= 400 {
 		// Don't try to continue on top of an upstream error response —
 		// the model never actually emitted a clean tool_use turn, and
 		// the body shape may not match what extractAnthropicAssistantContent
 		// expects.
-		return nil, 0, "", nil
+		return nil, 0, "", nil, nil
 	}
 	var toolResults []llmproxy.ContinuationToolResult
 	for _, dec := range processed.Decisions {
@@ -1300,7 +1382,7 @@ func (h *LLMEndpointHandler) tryContinuation(
 		})
 	}
 	if len(toolResults) == 0 {
-		return nil, 0, "", nil
+		return nil, 0, "", nil, nil
 	}
 	// Tool_use / tool_result must be 1:1 for the upstream — Anthropic
 	// and OpenAI Chat both 400 on an unbalanced continuation body. If
@@ -1349,11 +1431,11 @@ func (h *LLMEndpointHandler) tryContinuation(
 		if h.AuditEmitter != nil {
 			h.AuditEmitter.LogContinuationSkippedSiblingTools(r.Context(), agent, requestID, autoApprovedTaskID, autoApprovedTUID, droppedNames)
 		}
-		return nil, 0, "", nil
+		return nil, 0, "", nil, nil
 	}
 	contBody, err := llmproxy.BuildContinuationBody(provider, upstreamCT, inboundBody, upstreamBody, toolResults)
 	if err != nil {
-		return nil, 0, "", fmt.Errorf("build continuation body: %w", err)
+		return nil, 0, "", nil, fmt.Errorf("build continuation body: %w", err)
 	}
 	h.Logger.DebugContext(r.Context(), "lite-proxy continuation forwarding",
 		"request_id", requestID,
@@ -1364,19 +1446,32 @@ func (h *LLMEndpointHandler) tryContinuation(
 	)
 	resp, err := h.Forwarder.Forward(r.Context(), agent.UserID, agent.ID, provider, r, contBody)
 	if err != nil {
-		return nil, 0, "", fmt.Errorf("forward continuation: %w", err)
+		return nil, 0, "", nil, fmt.Errorf("forward continuation: %w", err)
 	}
 	defer resp.Body.Close()
 	full, readErr := readResponseLimited(resp.Body, h.MaxResponseBytes)
 	if readErr != nil {
-		return nil, 0, "", fmt.Errorf("read continuation upstream: %w", readErr)
+		return nil, 0, "", nil, fmt.Errorf("read continuation upstream: %w", readErr)
 	}
 	if resp.StatusCode >= 400 {
-		return nil, 0, "", fmt.Errorf("continuation upstream returned %d", resp.StatusCode)
+		return nil, 0, "", nil, fmt.Errorf("continuation upstream returned %d", resp.StatusCode)
 	}
 	contCT := resp.Header.Get("Content-Type")
 	if contCT == "" {
 		contCT = upstreamCT
+	}
+	// Extract usage on the continuation body so its tokens land in
+	// the per-task cost rollup. Without this, any auto-approved
+	// task that proceeds via continuation would under-report by
+	// exactly the tokens the post-approval call burned — typically
+	// the call that actually does the work. The continuation reuses
+	// the inbound request's model (BuildContinuationBody preserves
+	// it) so the upstream body will name the same model — no
+	// requestModel fallback needed.
+	var contUsage *llmproxy.ExtractUsageResult
+	if u := llmproxy.ExtractUsage(provider, contCT, full, ""); u.Found {
+		uc := u
+		contUsage = &uc
 	}
 	// Refresh decision inputs before the continuation postprocess. The
 	// original cfg.CandidateTasks was loaded at the top of serve(),
@@ -1502,7 +1597,7 @@ func (h *LLMEndpointHandler) tryContinuation(
 		}
 	}
 
-	return &newProcessed, resp.StatusCode, contCT, nil
+	return &newProcessed, resp.StatusCode, contCT, contUsage, nil
 }
 
 // readResponseLimited mirrors readLimited for upstream responses. Default
@@ -1546,6 +1641,23 @@ func (w *limitedCaptureWriter) Bytes() []byte {
 		return nil
 	}
 	return w.buf.Bytes()
+}
+
+// pricingModelMatch reports whether two model identifiers resolve to
+// the same pricing-table row (case, vendor prefix, date suffix, etc.
+// are all collapsed by pricing.Normalize). Used to gate the
+// continuation token-merge so a continuation that resolves to a
+// different upstream model can't get billed at the first call's rate.
+// Returns false when either side is empty — without a known model we
+// can't prove a match, and silently merging unattributable tokens
+// risks mispricing if a future caller starts populating only one
+// side (the existing extractor path leaves Model empty only on
+// pathological responses that fail to surface a model at all).
+func pricingModelMatch(a, b string) bool {
+	if a == "" || b == "" {
+		return false
+	}
+	return pricing.Normalize(a) == pricing.Normalize(b)
 }
 
 // actionForRoute maps a request path to an audit-log action label.

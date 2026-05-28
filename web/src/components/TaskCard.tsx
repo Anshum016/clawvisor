@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { api, type Task, type TaskAction, type AuditEntry, type RiskAssessment, type ApprovalRationale, type ScopeOverride, type PlannedCall, type ExpectedTool, type ExpectedEgress } from '../api/client'
+import { api, type Task, type TaskAction, type AuditEntry, type RiskAssessment, type ApprovalRationale, type ScopeOverride, type PlannedCall, type ExpectedTool, type ExpectedEgress, type TaskCostSummary } from '../api/client'
 import { format } from 'date-fns'
 import { serviceName, actionName } from '../lib/services'
 import { isLocalHost } from '../lib/env'
@@ -69,7 +69,7 @@ export default function TaskCard({
   const qc = useQueryClient()
   const [result, setResult] = useState<string | null>(null)
   const [expanded, setExpanded] = useState(false)
-  const [activeTab, setActiveTab] = useState<'activity' | 'scopes'>(
+  const [activeTab, setActiveTab] = useState<'activity' | 'scopes' | 'cost'>(
     task.request_count === 0 ? 'scopes' : 'activity'
   )
   const [scopesOpenInExpansion, setScopesOpenInExpansion] = useState(false)
@@ -120,7 +120,33 @@ export default function TaskCard({
   const isActive = task.status === 'active'
   const isStanding = task.lifetime === 'standing'
   const isActionable = needsApproval || needsExpansion
-  const activityVisible = !isActionable && expanded && activeTab === 'activity'
+  // Fetch cost as soon as the card is expanded (not gated on tab click)
+  // so we can decide whether to render the Cost tab at all — non-llm-proxy
+  // tasks return request_count=0 and the tab stays hidden. The query is
+  // cheap when there are no rows.
+  const costPrefetchEnabled = !isActionable && expanded
+
+  const { data: costData, isLoading: costLoading } = useQuery({
+    queryKey: ['task-cost', task.id],
+    queryFn: () => api.tasks.cost(task.id),
+    enabled: costPrefetchEnabled,
+    // Poll while the card is expanded on an active task so a
+    // newly-appearing cost row makes the tab show up without a manual
+    // refresh. Drops to no-poll once the task is no longer active.
+    refetchInterval: costPrefetchEnabled && isActive ? 5_000 : false,
+  })
+  const hasCostData = (costData?.request_count ?? 0) > 0
+  // If the user picked Cost and the data later disappears (refetch
+  // returns 0 rows, error, etc.), the tab button vanishes but
+  // activeTab is still 'cost' — that strands them on an empty panel
+  // with no obvious way back. Fall through to the default tab in
+  // that case. Local-only; activeTab itself stays as-is so if data
+  // reappears the original selection takes effect again.
+  const effectiveTab: typeof activeTab =
+    activeTab === 'cost' && !hasCostData
+      ? (task.request_count === 0 ? 'scopes' : 'activity')
+      : activeTab
+  const activityVisible = !isActionable && expanded && effectiveTab === 'activity'
 
   const { data: auditData, isLoading: auditLoading } = useQuery({
     queryKey: ['audit', { task_id: task.id }],
@@ -429,7 +455,7 @@ export default function TaskCard({
             <button
               onClick={() => setActiveTab('activity')}
               className={`px-3 py-2.5 text-[12.5px] border-b-2 -mb-px transition-colors ${
-                activeTab === 'activity'
+                effectiveTab === 'activity'
                   ? 'text-text-primary border-brand'
                   : 'text-text-tertiary border-transparent hover:text-text-secondary'
               }`}
@@ -439,16 +465,33 @@ export default function TaskCard({
             <button
               onClick={() => setActiveTab('scopes')}
               className={`px-3 py-2.5 text-[12.5px] border-b-2 -mb-px transition-colors ${
-                activeTab === 'scopes'
+                effectiveTab === 'scopes'
                   ? 'text-text-primary border-brand'
                   : 'text-text-tertiary border-transparent hover:text-text-secondary'
               }`}
             >
               Scopes
             </button>
+            {/* Cost tab appears only when the prefetch (kicked off on
+                expand) has confirmed at least one llm_request_cost row
+                for this task. Tasks not driven through the lite-proxy
+                — regular API tasks, control-plane-only flows — return
+                request_count=0 and never surface the tab. */}
+            {hasCostData && (
+              <button
+                onClick={() => setActiveTab('cost')}
+                className={`px-3 py-2.5 text-[12.5px] border-b-2 -mb-px transition-colors ${
+                  effectiveTab === 'cost'
+                    ? 'text-text-primary border-brand'
+                    : 'text-text-tertiary border-transparent hover:text-text-secondary'
+                }`}
+              >
+                Cost
+              </button>
+            )}
           </div>
 
-          {activeTab === 'activity' && (
+          {effectiveTab === 'activity' && (
             <div className="divide-y divide-border-subtle text-sm">
               {auditLoading && <div className="px-4 py-2 text-xs text-text-tertiary">Loading...</div>}
               {!auditLoading && auditEntries.length === 0 && (
@@ -458,7 +501,7 @@ export default function TaskCard({
             </div>
           )}
 
-          {activeTab === 'scopes' && (
+          {effectiveTab === 'scopes' && (
             <div className="pt-3">
               {showRisk && <RiskPanel risk={riskDetails} level={riskLevel} />}
               {showRationale && <AutoApprovalPanel rationale={task.approval_rationale!} />}
@@ -498,6 +541,10 @@ export default function TaskCard({
                 )}
               </div>
             </div>
+          )}
+
+          {effectiveTab === 'cost' && (
+            <CostPanel data={costData} loading={costLoading} />
           )}
 
           {!result && isActive && (
@@ -1038,6 +1085,98 @@ function ActivityRow({ entry }: { entry: AuditEntry }) {
           <ParamsTable params={entry.params_safe} />
         </div>
       )}
+    </div>
+  )
+}
+
+// ── Cost panel ────────────────────────────────────────────────────────────────
+
+function formatMicros(micros: number): string {
+  // Sub-cent precision matters at low token counts (a single short
+  // request can be ~$0.0001). Switch format at $1 so the column
+  // doesn't render as "0.0001" forever. Zero collapses to "$0.00"
+  // so a task whose models are all unpriced doesn't read as a long
+  // string of zeros.
+  if (micros === 0) return '$0.00'
+  const dollars = micros / 1_000_000
+  if (dollars >= 1) return `$${dollars.toFixed(2)}`
+  if (dollars >= 0.01) return `$${dollars.toFixed(4)}`
+  return `$${dollars.toFixed(6)}`
+}
+
+function formatTokens(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`
+  return String(n)
+}
+
+function CostPanel({ data, loading }: { data: TaskCostSummary | undefined; loading: boolean }) {
+  if (loading) {
+    return <div className="px-4 py-3 text-xs text-text-tertiary">Loading…</div>
+  }
+  if (!data || data.request_count === 0) {
+    return (
+      <div className="px-4 py-3 text-xs text-text-tertiary">
+        No LLM requests recorded for this task yet.
+      </div>
+    )
+  }
+  const hasUnknown = data.unknown_models.length > 0
+  return (
+    <div className="px-4 py-3 space-y-3">
+      <div className="grid grid-cols-3 gap-3">
+        <Stat label="Total cost" value={formatMicros(data.cost_micros)} mono />
+        <Stat label="Requests" value={String(data.request_count)} mono />
+        <Stat label="Tokens"
+          value={`${formatTokens(data.input_tokens + data.output_tokens + data.cache_read_tokens + data.cache_write_tokens)}`}
+          mono />
+      </div>
+      {hasUnknown && (
+        <div className="text-[11px] text-warning">
+          Cost is a lower bound — pricing not configured for: {data.unknown_models.join(', ')}
+        </div>
+      )}
+      {data.by_model.length > 0 && (
+        <div className="border border-border-subtle rounded overflow-hidden">
+          <table className="w-full text-xs">
+            <thead className="bg-surface-2">
+              <tr className="text-text-tertiary">
+                <th className="text-left px-3 py-1.5 font-medium">Model</th>
+                <th className="text-right px-3 py-1.5 font-medium">Reqs</th>
+                <th className="text-right px-3 py-1.5 font-medium">Input</th>
+                <th className="text-right px-3 py-1.5 font-medium">Output</th>
+                <th className="text-right px-3 py-1.5 font-medium">Cache R/W</th>
+                <th className="text-right px-3 py-1.5 font-medium">Cost</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-border-subtle">
+              {data.by_model.map(m => (
+                <tr key={m.model}>
+                  <td className="px-3 py-1.5 font-mono text-text-primary">{m.model}</td>
+                  <td className="px-3 py-1.5 text-right font-mono text-text-secondary">{m.request_count}</td>
+                  <td className="px-3 py-1.5 text-right font-mono text-text-secondary">{formatTokens(m.input_tokens)}</td>
+                  <td className="px-3 py-1.5 text-right font-mono text-text-secondary">{formatTokens(m.output_tokens)}</td>
+                  <td className="px-3 py-1.5 text-right font-mono text-text-secondary">
+                    {formatTokens(m.cache_read_tokens)} / {formatTokens(m.cache_write_tokens)}
+                  </td>
+                  <td className="px-3 py-1.5 text-right font-mono text-text-primary">
+                    {m.known ? formatMicros(m.cost_micros) : <span className="text-warning">—</span>}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function Stat({ label, value, mono }: { label: string; value: string; mono?: boolean }) {
+  return (
+    <div className="bg-surface-2 rounded px-3 py-2">
+      <div className="text-[10px] uppercase tracking-wider text-text-tertiary">{label}</div>
+      <div className={`text-sm text-text-primary mt-0.5 ${mono ? 'font-mono' : ''}`}>{value}</div>
     </div>
   )
 }
