@@ -2,6 +2,7 @@ package llmproxy
 
 import (
 	"encoding/json"
+	"regexp"
 	"strings"
 
 	"github.com/clawvisor/clawvisor/internal/runtime/conversation"
@@ -231,20 +232,21 @@ func flattenOpenAIChatContent(raw json.RawMessage) string {
 // content-shape level (see extractAnthropicUserText), so this helper
 // only needs to recognize the conversational-verb cases.
 func isClawvisorInternalUserText(text string) bool {
-	if containsInlineApprovalAugmentationMarker(text) ||
-		strings.Contains(text, InlineTaskDenyMarker) ||
-		strings.Contains(text, InlineTaskCreatorErrorMarker) {
+	// containsInlineApprovalAugmentationMarker catches the user-side
+	// task-approved / task-denied / task-error notices the proxy
+	// substitutes when an inline approval resolves. It looks for the
+	// `<clawvisor-notice kind="task-` literal anywhere in the text —
+	// since the augmenter REPLACES the user's verb with the notice
+	// (not appends), an inbound user turn containing this substring
+	// is by construction the proxy's own emission.
+	if containsInlineApprovalAugmentationMarker(text) {
 		return true
 	}
-	// Defense in depth: any user-role text whose first non-whitespace
-	// content is the [Clawvisor] proxy prefix is not a fresh human
-	// turn. Today the only [Clawvisor] injections happen on the
-	// assistant side (auto-approval notice), so this filter is a
-	// no-op in production. Adding it now so a future codepath that
-	// (intentionally or by mistake) routes proxy-prefixed text
-	// through the user role can't smuggle authorization into the
-	// auto-approve gate.
-	if strings.HasPrefix(strings.TrimSpace(text), "[Clawvisor]") {
+	// Strict-shape match for any proxy-emitted <clawvisor-notice>
+	// element (routing-style minted markers, future user-role notices).
+	// Substring matching would be a footgun — a user asking "what is
+	// <clawvisor-notice>?" would have their message silently dropped.
+	if isExactClawvisorNoticeShape(text) {
 		return true
 	}
 	// Only filter when the user's ENTIRE trimmed message is a bare
@@ -256,6 +258,25 @@ func isClawvisorInternalUserText(text string) bool {
 	// from the auto-approve assessor's view and the deterministic
 	// floor forced the manual prompt.
 	return isExactApprovalReplyShape(text)
+}
+
+// exactClawvisorNoticeRE matches the entire string as a single
+// well-formed <clawvisor-notice kind="..."> element. Kind is constrained
+// to the same alphabet as the renderer's validator (`^[a-z0-9-]+$`);
+// the body is forbidden from containing `<` so a body that holds a
+// forged extra `</clawvisor-notice>` substring cannot trick the
+// matcher into accepting trailing user text. The renderer XML-escapes
+// `<` in bodies, so this restriction never rejects a genuine proxy-
+// emitted notice.
+var exactClawvisorNoticeRE = regexp.MustCompile(`^<clawvisor-notice kind="[a-z0-9-]+">[^<]*</clawvisor-notice>$`)
+
+// isExactClawvisorNoticeShape reports whether the entire trimmed text
+// is exactly one well-formed Clawvisor notice element. Trailing or
+// leading content makes it NOT a match — a user-role message that
+// merely mentions the tag (e.g. a question about it) stays a fresh
+// human turn.
+func isExactClawvisorNoticeShape(text string) bool {
+	return exactClawvisorNoticeRE.MatchString(strings.TrimSpace(text))
 }
 
 // isExactApprovalReplyShape reports whether the supplied text, when

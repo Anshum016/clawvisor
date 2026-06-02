@@ -132,6 +132,67 @@ func TestScrubHistoricalResponseNoticesFromOpenAIChatRequest(t *testing.T) {
 	}
 }
 
+// TestScrubHistoricalResponseNoticesFromAnthropicRequest_BackticksForm
+// exercises the backticked `[Clawvisor] Observe mode: …` branch of
+// observeNoticePrefixRE. Production emits this form, so a regression
+// in the regex would leave the notice accumulating in echoed history
+// on every turn — silently spamming the model. The legacy variants
+// already have coverage in the test above; this one pins the current
+// shape end-to-end through scrubHistoricalResponseNoticesFromRequest.
+func TestScrubHistoricalResponseNoticesFromAnthropicRequest_BackticksForm(t *testing.T) {
+	t.Parallel()
+
+	req, _ := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", nil)
+	noticeWithSuffix := observeModeInjectedUserNotice("agent_123", "http://127.0.0.1:25297") + "\n\nHi there."
+	standaloneNotice := observeModeInjectedUserNotice("agent_123", "")
+	userQuoted := "Why does Clawvisor inject `[Clawvisor] Observe mode: …` into my history?"
+
+	bodyMap := map[string]any{
+		"messages": []map[string]any{
+			{"role": "assistant", "content": []map[string]any{
+				{"type": "text", "text": standaloneNotice},
+			}},
+			{"role": "assistant", "content": []map[string]any{
+				{"type": "text", "text": noticeWithSuffix},
+			}},
+			{"role": "user", "content": []map[string]any{
+				{"type": "text", "text": userQuoted},
+			}},
+		},
+	}
+	body, err := json.Marshal(bodyMap)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+
+	rewritten, changed := scrubHistoricalResponseNoticesFromRequest(req, body)
+	if !changed {
+		t.Fatal("expected backticked-form notice to be scrubbed")
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(rewritten, &payload); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	messages, _ := payload["messages"].([]any)
+	first, _ := messages[0].(map[string]any)
+	firstContent, _ := first["content"].([]any)
+	if len(firstContent) != 0 {
+		t.Fatalf("expected standalone backticked notice block to be removed, got %d blocks", len(firstContent))
+	}
+	second, _ := messages[1].(map[string]any)
+	secondContent, _ := second["content"].([]any)
+	block, _ := secondContent[0].(map[string]any)
+	if got, _ := block["text"].(string); got != "Hi there." {
+		t.Fatalf("expected backticked notice prefix to be removed, got %q", got)
+	}
+	third, _ := messages[2].(map[string]any)
+	thirdContent, _ := third["content"].([]any)
+	userBlock, _ := thirdContent[0].(map[string]any)
+	if got, _ := userBlock["text"].(string); got != userQuoted {
+		t.Fatalf("expected user-authored quoted text mentioning the notice to be preserved, got %q", got)
+	}
+}
+
 func TestScrubHistoricalResponseNoticeTextPreservesSimilarButNonExactPrefix(t *testing.T) {
 	t.Parallel()
 
