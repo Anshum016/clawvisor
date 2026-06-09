@@ -19,8 +19,10 @@ import (
 	runtimeautovault "github.com/clawvisor/clawvisor/internal/runtime/autovault"
 	"github.com/clawvisor/clawvisor/internal/runtime/conversation"
 	"github.com/clawvisor/clawvisor/internal/runtime/llmproxy"
+	"github.com/clawvisor/clawvisor/internal/runtime/llmproxy/bodytransform"
 	"github.com/clawvisor/clawvisor/internal/runtime/llmproxy/scriptjudge"
 	"github.com/clawvisor/clawvisor/internal/runtime/llmproxy/inspector"
+	"github.com/clawvisor/clawvisor/internal/runtime/llmproxy/jsonsurgery"
 	"github.com/clawvisor/clawvisor/internal/runtime/llmproxy/policies"
 	"github.com/clawvisor/clawvisor/internal/runtime/llmproxy/postproc"
 	"github.com/clawvisor/clawvisor/internal/runtime/llmproxy/pricing"
@@ -3745,26 +3747,27 @@ func (h *LLMEndpointHandler) applyRememberedSecretRewrites(ctx context.Context, 
 	return out, modified, nil
 }
 
+// rewriteJSONStrings applies the replacements map to every string value
+// in body and returns the rewritten body. Unchanged subtrees pass through
+// with their original bytes intact. Changed subtrees are re-emitted with
+// original key order preserved.
+//
+// Byte fidelity matters here: Anthropic verifies thinking and
+// redacted_thinking block signatures across turns, and any byte change to
+// those blocks — including reordering sibling keys, normalizing
+// whitespace, or rewriting text inside the `thinking` field — invalidates
+// the signature and the next request gets rejected with
+// "thinking … blocks in the latest assistant message cannot be modified".
+// Signed blocks are therefore passed through verbatim (the secret-scan
+// path at secret_detection.go:277 applies the same skip during detection;
+// the rewrite path historically did not, which is what scrambled keys in
+// staging when a vaulted value appeared anywhere in the request body).
 func rewriteJSONStrings(body []byte, replacements map[string]string) ([]byte, bool, error) {
 	if len(body) == 0 || len(replacements) == 0 {
 		return body, false, nil
 	}
-	var parsed any
-	if err := json.Unmarshal(body, &parsed); err != nil {
-		return nil, false, err
-	}
 	keys := sortedReplacementKeys(replacements)
-	rewritten, modified := rewriteJSONValueStrings(parsed, replacements, keys)
-	if !modified {
-		return body, false, nil
-	}
-	// Re-marshaling intentionally canonicalizes object key order and
-	// whitespace. The upstream LLM APIs only care about semantic JSON.
-	out, err := json.Marshal(rewritten)
-	if err != nil {
-		return nil, false, err
-	}
-	return out, true, nil
+	return rewriteJSONValue(body, replacements, keys)
 }
 
 func sortedReplacementKeys(replacements map[string]string) []string {
@@ -3784,37 +3787,92 @@ func sortedReplacementKeys(replacements map[string]string) []string {
 	return keys
 }
 
-func rewriteJSONValueStrings(value any, replacements map[string]string, keys []string) (any, bool) {
-	switch typed := value.(type) {
-	case string:
-		out := typed
-		for _, secret := range keys {
-			out = strings.ReplaceAll(out, secret, replacements[secret])
-		}
-		return out, out != typed
-	case []any:
-		modified := false
-		for i, item := range typed {
-			rewritten, changed := rewriteJSONValueStrings(item, replacements, keys)
-			if changed {
-				typed[i] = rewritten
-				modified = true
-			}
-		}
-		return typed, modified
-	case map[string]any:
-		modified := false
-		for key, item := range typed {
-			rewritten, changed := rewriteJSONValueStrings(item, replacements, keys)
-			if changed {
-				typed[key] = rewritten
-				modified = true
-			}
-		}
-		return typed, modified
-	default:
-		return value, false
+func rewriteJSONValue(data []byte, replacements map[string]string, keys []string) ([]byte, bool, error) {
+	trimmed := jsonsurgery.TrimWS(data)
+	if len(trimmed) == 0 {
+		return data, false, nil
 	}
+	switch trimmed[0] {
+	case '"':
+		return rewriteJSONStringLeaf(data, replacements, keys)
+	case '[':
+		return rewriteJSONArray(data, replacements, keys)
+	case '{':
+		return rewriteJSONObject(data, replacements, keys)
+	default:
+		return data, false, nil
+	}
+}
+
+func rewriteJSONStringLeaf(data []byte, replacements map[string]string, keys []string) ([]byte, bool, error) {
+	var s string
+	if err := json.Unmarshal(data, &s); err != nil {
+		return nil, false, err
+	}
+	out := s
+	for _, key := range keys {
+		out = strings.ReplaceAll(out, key, replacements[key])
+	}
+	if out == s {
+		return data, false, nil
+	}
+	enc, err := json.Marshal(out)
+	if err != nil {
+		return nil, false, err
+	}
+	return enc, true, nil
+}
+
+func rewriteJSONArray(data []byte, replacements map[string]string, keys []string) ([]byte, bool, error) {
+	elements, ok := jsonsurgery.FlattenArray(data)
+	if !ok {
+		return data, false, nil
+	}
+	out := make([]json.RawMessage, len(elements))
+	anyChanged := false
+	for i, elem := range elements {
+		newElem, changed, err := rewriteJSONValue(elem, replacements, keys)
+		if err != nil {
+			return nil, false, err
+		}
+		out[i] = newElem
+		if changed {
+			anyChanged = true
+		}
+	}
+	if !anyChanged {
+		return data, false, nil
+	}
+	enc, err := json.Marshal(out)
+	if err != nil {
+		return nil, false, err
+	}
+	return enc, true, nil
+}
+
+func rewriteJSONObject(data []byte, replacements map[string]string, keys []string) ([]byte, bool, error) {
+	if bodytransform.IsThinkingBlock(data) {
+		return data, false, nil
+	}
+	fields, ok := jsonsurgery.FlattenObject(data)
+	if !ok {
+		return data, false, nil
+	}
+	anyChanged := false
+	for i := range fields {
+		newVal, changed, err := rewriteJSONValue(fields[i].Value, replacements, keys)
+		if err != nil {
+			return nil, false, err
+		}
+		if changed {
+			fields[i].Value = newVal
+			anyChanged = true
+		}
+	}
+	if !anyChanged {
+		return data, false, nil
+	}
+	return jsonsurgery.MarshalObjectFields(fields), true, nil
 }
 
 func (h *LLMEndpointHandler) loadActiveSecretRewrites(ctx context.Context, agent *store.Agent) (map[string]liteSecretVaultRewrite, error) {
