@@ -382,56 +382,108 @@ func TestInstallerCodexProviderSlugByEnv(t *testing.T) {
 
 func TestInstallerHermesRender(t *testing.T) {
 	h := NewInstallerHandler("", "", true, "", "")
-	body := installerGet(t, h, "hermes", "")
+	body := installerGet(t, h, "hermes", "abcDEF1234")
 
 	assertContainsAll(t, body,
 		"# Connect Hermes to Clawvisor",
 		"swap mode",
-		"dashboard step before this skill",
-		"upstream OpenAI API key",
-		// Token is already on disk; the skill reads it from there.
-		"already been minted",
-		"~/.clawvisor/agents/hermes.json",
-		"OPENAI_BASE_URL=",
-		"/api/v1",
+		// Step 1: skill registers the agent via claim auto-approve.
+		"## 1. Register and persist the token",
+		"claim=abcDEF1234",
+		"/api/agents/connect",
+		`"$TOKEN_FILE"`,
+		// Step 2: detect provider — read env + ~/.hermes/config.yaml safely
+		// (python yaml extracts only base_url, never the api_key).
+		"## 2. Detect the upstream LLM provider",
+		"python3 -c \"import yaml",
+		"model.base_url",
+		"DO NOT `cat`, `grep`, `head`, or `tail`",
+		// Detection branches by signal (env + config base_url host).
+		`[ -n "$ANTHROPIC_API_KEY" ]`,
+		`[ -n "$OPENAI_API_KEY" ]`,
+		"*anthropic.com*",
+		"*openai.com*",
+		// Re-install signal: if Hermes's existing base_url points at a
+		// Clawvisor instance, the trailing path tells us which provider
+		// was picked last time.
+		"*/api/v1*",
+		"*/api|*/api/",
+		// model.default name pattern — actively-used model is the
+		// strongest single hint.
+		`DEFAULT=$(python3 -c "import yaml`,
+		`(d.get('model') or {}).get('default')`,
+		"anthropic/*|*claude*",
+		"openai/*|*gpt*|*o1-*|*o3-*|*o4-*",
+		// HARD CONSTRAINT: the helper must ask the user and wait for a
+		// reply. The earlier shape of this skill let helpers default
+		// silently — we have a real bug report from the field on that.
+		"HARD CONSTRAINT: you must not pick `$PROVIDER` yourself",
+		"DO NOT decide silently",
+		"Wait for the user's reply before going further",
+		// Case block derives every per-provider variable at runtime.
+		`case "$PROVIDER" in`,
+		"PROVIDER_LABEL='Anthropic'",
+		"PROVIDER_LABEL='OpenAI'",
+		"BASE_PATH='/api'",
+		"BASE_PATH='/api/v1'",
+		"BASE_ENV='ANTHROPIC_BASE_URL'",
+		"BASE_ENV='OPENAI_BASE_URL'",
+		"KEY_ENV='ANTHROPIC_API_KEY'",
+		"KEY_ENV='OPENAI_API_KEY'",
+		"KEY_PREFIX='sk-ant-'",
+		"KEY_PREFIX='sk-'",
+		// Step 3: credential check uses $PROVIDER, not a baked string.
+		"## 3. Ensure a vaulted upstream key exists",
+		"/api/runtime/llm-credentials",
+		`select(.provider==$p`,
+		`### 3.a. Vault a $PROVIDER_LABEL API key`,
+		// Step 4-6: probe, preflight, configure all use shell vars.
+		"## 4. Probe the Hermes deployment",
+		"$HERMES_MODE",
+		"## 5. Preflight: confirm Hermes can reach Clawvisor",
+		"/api/skill/catalog",
+		"## 6. Configure Hermes",
+		// env-var snippet uses `env NAME=VALUE` with dynamic names from
+		// $BASE_ENV / $KEY_ENV — no provider literal.
+		`"$BASE_ENV=$CLAWVISOR_LLM_URL$BASE_PATH"`,
+		`"$KEY_ENV=$TOKEN"`,
 		"~/.hermes/config.yaml",
-		"hermes-cv()",
+		"hermes-cv",
+		// Config-file mode: secrets in ~/.hermes/.env (Hermes docs are
+		// explicit — config.yaml carries non-secret config only), with
+		// ${HERMES_CV_API_KEY} substitution into config.yaml.
+		"~/.hermes/.env",
+		"HERMES_CV_API_KEY=$TOKEN",
+		`chmod 600 ~/.hermes/.env`,
+		// Backslash-escaped in the heredoc so bash doesn't expand it; the
+		// file that actually lands on disk is `api_key: "${HERMES_CV_API_KEY}"`,
+		// which Hermes resolves from ~/.hermes/.env at runtime.
+		`api_key: "\${HERMES_CV_API_KEY}"`,
+		// Setup-shape cleanup paths.
+		"rm -f ~/.claude/commands/clawvisor-setup.md",
+		"rm -rf ~/.codex/skills/clawvisor-setup",
+	)
+	// The skill must NOT bake the provider — no static ANTHROPIC_/OPENAI_
+	// env-var names, no static /api or /api/v1 path, no provider-specific
+	// vault headings, no "Anthropic key" / "OpenAI key" prose in the
+	// ensure-vaulted step.
+	for _, forbidden := range []string{
+		"already been minted",
+		"dashboard step before this skill",
+		"Dashboard answers",
 		"rm -f ~/.claude/commands/clawvisor-install.md",
-		"rm -rf ~/.codex/skills/clawvisor-install",
-	)
-	// The mint step has been moved to the dashboard's bootstrap script; the
-	// skill should NOT contain a fresh `POST /api/agents/connect` block.
-	for _, forbidden := range []string{
-		"## 2. Mint a connection request",
-		"Do not reuse a token",
-		"RESPONSE=$(curl",
-	} {
-		if strings.Contains(body, forbidden) {
-			t.Errorf("Hermes skill should no longer mint a connection request: contains %q", forbidden)
-		}
-	}
-	if strings.Contains(body, "Check for an existing token") {
-		t.Errorf("installer should not offer to reuse an existing token")
-	}
-}
-
-func TestInstallerHermesAnthropicProviderRender(t *testing.T) {
-	h := NewInstallerHandler("", "", true, "", "")
-	body := installerGetQuery(t, h, "hermes", "llm_provider=anthropic")
-
-	assertContainsAll(t, body,
-		"LLM provider: Anthropic",
-		"upstream Anthropic API key",
+		// Provider literals that would mean we're baking the choice:
+		"## 2. Ensure a OpenAI key is vaulted",
+		"## 2. Ensure a Anthropic key is vaulted",
+		"### 2.a. Vault a OpenAI API key",
+		"### 2.a. Vault a Anthropic API key",
+		"ANTHROPIC_API_KEY=\"$TOKEN\"",
+		"OPENAI_API_KEY=\"$TOKEN\"",
 		"ANTHROPIC_BASE_URL=http://",
-		"/api \\",
-		"ANTHROPIC_API_KEY=$(jq -r .token ~/.clawvisor/agents/hermes.json)",
-	)
-	for _, forbidden := range []string{
-		"OPENAI_BASE_URL=",
-		"OPENAI_API_KEY=$(jq -r .token ~/.clawvisor/agents/hermes.json)",
+		"OPENAI_BASE_URL=http://",
 	} {
 		if strings.Contains(body, forbidden) {
-			t.Errorf("Hermes Anthropic setup should not contain OpenAI command text %q", forbidden)
+			t.Errorf("Hermes one-paste skill should not contain provider-baked text %q", forbidden)
 		}
 	}
 }
@@ -442,147 +494,152 @@ func TestInstallerOpenClawRender(t *testing.T) {
 
 	assertContainsAll(t, body,
 		"# Connect OpenClaw to Clawvisor",
-		"LLM base URL",
-		"Anthropic API key",
-		"OpenClaw running mode: host",
-		"## 1. Confirm how to run OpenClaw onboarding",
-		// The bootstrap script writes the token to disk first; the configure
-		// step now reads it instead of minting a new connection request.
-		"already been minted",
-		"~/.clawvisor/agents/openclaw.json",
-		// Preflight runs before the onboard command so OpenClaw's
-		// connectivity to Clawvisor is verified from OpenClaw's own
-		// execution context (helper shell, docker container, etc.) before
-		// the URL gets baked into OpenClaw's config.
-		"## 2. Preflight: confirm OpenClaw can reach Clawvisor",
-		"docker compose run --rm",
+		// Step 1: claim auto-approve register.
+		"## 1. Register and persist the token",
+		"claim=CLAIMOPEN12",
+		"/api/agents/connect",
+		`"$TOKEN_FILE"`,
+		// Step 2: detect provider — reads env + the global openclaw.json
+		// provider keys via jq (no per-agent models.json file exists, per
+		// docs.openclaw.ai/concepts/model-providers).
+		"## 2. Detect the upstream LLM provider",
+		`~/.openclaw/openclaw.json`,
+		`jq -r '.models.providers // {} | keys[]?'`,
+		"anthropic*|claude*",
+		"openai*|gpt*",
+		// Strongest signal: scan EVERY provider's `api` field so a
+		// non-default-named provider (`custom-host-docker-internal-25297`,
+		// `local-llm`, etc.) still gives a wire-protocol hit.
+		`for api in $(jq -r '.models.providers // {} | to_entries[]?.value.api`,
+		"anthropic-messages)                  DETECTED=",
+		"openai-completions|openai-responses) DETECTED=",
+		// Default model — strongest hint of what's actively used.
+		`DEFAULT_MODEL=$(jq -r '.models.default`,
+		`DEFAULT_PROVIDER="${DEFAULT_MODEL%%/*}"`,
+		`DEFAULT_API=$(jq -r --arg p "$DEFAULT_PROVIDER" '.models.providers[$p].api`,
+		// HARD CONSTRAINT: ask the user, don't pick silently. Lock this
+		// against regression — we got a real bug report from the field.
+		"HARD CONSTRAINT: you must not pick `$PROVIDER` yourself",
+		"DO NOT decide silently",
+		"Wait for the user's reply before going further",
+		// Case block (shared with Hermes via providerCaseBlock). OPENCLAW_API
+		// is the on-disk `api` field value (distinct from the
+		// --custom-compatibility flag value that onboard takes).
+		`case "$PROVIDER" in`,
+		"PROVIDER_LABEL='Anthropic'",
+		"PROVIDER_LABEL='OpenAI'",
+		"MODEL_ID='claude-sonnet-4-6'",
+		"MODEL_ID='gpt-5.4'",
+		"CONTEXT_WINDOW=200000",
+		"CONTEXT_WINDOW=1000000",
+		"OPENCLAW_API='anthropic-messages'",
+		"OPENCLAW_API='openai-completions'",
+		// Step 3: ensure vaulted key (provider-agnostic title).
+		"## 3. Ensure a vaulted upstream key exists",
+		"/api/runtime/llm-credentials",
+		`### 3.a. Vault a $PROVIDER_LABEL API key`,
+		// Step 4-5: probe + preflight. Probe uses bare `openclaw` binary
+		// (not `openclaw-cli`).
+		"## 4. Probe the OpenClaw deployment",
+		`command -v openclaw >/dev/null 2>&1`,
+		"$OPENCLAW_MODE",
+		"## 5. Preflight: confirm OpenClaw can reach Clawvisor",
 		"-H \"X-Clawvisor-Agent-Token: $CLAWVISOR_TOKEN\"",
-		// dockerHostURL substitutes host.docker.internal for the resolved URL's
-		// localhost host; the port comes from httptest, so don't assert on it.
 		"host.docker.internal:",
 		"/api/skill/catalog",
-		"## 3. Point OpenClaw at Clawvisor",
-		"TOKEN=$(jq -r .token ~/.clawvisor/agents/openclaw.json)",
-		"openclaw-cli onboard --non-interactive",
-		"--auth-choice custom-api-key",
-		"--custom-base-url",
-		"--custom-api-key \"$TOKEN\"",
-		"--custom-compatibility anthropic",
-		"docker compose run --rm openclaw-cli onboard",
-		"host.docker.internal",
-		"OPENCLAW_MODEL_CONTEXT_WINDOW=200000",
-		"OPENCLAW_MAX_TOKENS=8192",
-		"reasonable floor",
-		"Claude Sonnet 4's 1M",
-		"models.json",
-		"contextWindow: $contextWindow",
-		"maxTokens: $maxTokens",
-		"rm -f ~/.claude/commands/clawvisor-install.md",
-		"rm -rf ~/.codex/skills/clawvisor-install",
-	)
-	for _, forbidden := range []string{
-		"Check for an existing token",
-		"callback_secret",
-		"callback secret",
-		"CLAWVISOR_CALLBACK_SECRET",
-		"OPENCLAW_HOOKS_URL",
-		"clawvisor-webhook",
-		"clawhub install",
-	} {
-		if strings.Contains(body, forbidden) {
-			t.Errorf("OpenClaw LLM-proxy setup should not contain callback/webhook text %q", forbidden)
-		}
-	}
-}
-
-func TestInstallerOpenClawOpenAIProviderRender(t *testing.T) {
-	h := NewInstallerHandler("", "", true, "", "")
-	body := installerGetQuery(t, h, "openclaw", "claim=CLAIMOPEN12&llm_provider=openai")
-
-	assertContainsAll(t, body,
-		"LLM provider: OpenAI",
-		"OpenAI API key",
-		"--custom-base-url \"http://",
-		"/api/v1",
-		"--custom-model-id \"gpt-5.4\"",
-		"--custom-compatibility openai",
-		// dockerHostURL renders host.docker.internal with httptest's
-		// ephemeral port, so assert on the host:port-agnostic suffix.
-		"host.docker.internal:",
-		"/api/v1\"",
-		"OPENCLAW_MODEL_ID=\"gpt-5.4\"",
-		"OPENCLAW_MODEL_CONTEXT_WINDOW=1000000",
-	)
-	for _, forbidden := range []string{
-		"--custom-model-id \"claude-sonnet-4-6\"",
-		"--custom-compatibility anthropic",
-	} {
-		if strings.Contains(body, forbidden) {
-			t.Errorf("OpenClaw OpenAI setup should not contain Anthropic command text %q", forbidden)
-		}
-	}
-}
-
-func TestInstallerOpenClawRemoteModeSkipsLocalProbe(t *testing.T) {
-	h := NewInstallerHandler("", "", true, "", "")
-	body := installerGetQuery(t, h, "openclaw", "claim=CLAIMOPEN12&openclaw_mode=remote")
-
-	assertContainsAll(t, body,
-		"Dashboard answers",
-		"OpenClaw running mode: remote",
-		"## 1. Confirm remote OpenClaw access",
-		"Do **not** probe the",
-		"export OPENCLAW_REMOTE=",
-		"Do **not** probe the",
-		"ssh \"$OPENCLAW_REMOTE\"",
-		"remote-reachable Clawvisor URL",
-		// Preflight defines `OPENCLAW_CLAWVISOR_URL` (base, no path);
-		// configure step appends `/api/v1` when building the onboard call.
+		// Step 6: configure via `openclaw config set models.providers.clawvisor`.
+		// Onboard is for first-time auth, not provider registration —
+		// docs.openclaw.ai/cli/config covers the merge pattern.
+		"## 6. Point OpenClaw at Clawvisor",
+		"PROVIDER_JSON=$(jq -n",
+		`--arg baseUrl "$CLAWVISOR_LLM_URL$BASE_PATH"`,
+		`--arg apiKey  "$TOKEN"`,
+		`--arg api     "$OPENCLAW_API"`,
+		`--arg modelId "$MODEL_ID"`,
+		`--argjson contextWindow "$CONTEXT_WINDOW"`,
+		"--argjson maxTokens 8192",
+		`openclaw config set models.providers.clawvisor "$PROVIDER_JSON" --strict-json --merge`,
+		`docker exec "$OPENCLAW_CONTAINER" openclaw config set models.providers.clawvisor`,
+		// Remote uses $(cat) substitution to pipe the JSON over stdin.
+		`ssh "$OPENCLAW_REMOTE" 'openclaw config set models.providers.clawvisor "$(cat)" --strict-json --merge'`,
 		"export OPENCLAW_CLAWVISOR_URL",
-		"$OPENCLAW_CLAWVISOR_URL/api/v1",
-		"--custom-base-url",
-		"--custom-api-key '$TOKEN'",
-		"--custom-compatibility anthropic",
-		"REMOTE_OPENCLAW_PATCH",
-		"OPENCLAW_MODEL_CONTEXT_WINDOW=200000",
-		"OPENCLAW_MAX_TOKENS=8192",
-		// Preflight (step 2) runs from the remote host's perspective before
-		// onboarding, so the URL OpenClaw will use is proven reachable
-		// before it gets baked into OpenClaw's config.
-		"## 2. Preflight: confirm OpenClaw can reach Clawvisor",
-		"ssh \"$OPENCLAW_REMOTE\" \"curl -fsSL",
-		"$OPENCLAW_CLAWVISOR_URL/api/skill/catalog",
+		"$OPENCLAW_CLAWVISOR_URL$BASE_PATH",
+		// Setup-shape cleanup paths.
+		"rm -f ~/.claude/commands/clawvisor-setup.md",
+		"rm -rf ~/.codex/skills/clawvisor-setup",
 	)
-
 	for _, forbidden := range []string{
-		"## 1. Probe the environment",
-		"`docker ps",
-		"check `~/.openclaw/` on the host",
-		"# Host install:",
-		"Both OpenClaw and Clawvisor in Docker on same host",
-		"Check for an existing token",
-		"Preferred task auto-approval default",
+		"already been minted",
+		"Dashboard answers",
+		"OpenClaw running mode: host",
 		"callback_secret",
 		"callback secret",
 		"CLAWVISOR_CALLBACK_SECRET",
 		"OPENCLAW_HOOKS_URL",
 		"clawvisor-webhook",
 		"clawhub install",
-		"CLAWVISOR_AGENT_TOKEN",
+		"rm -f ~/.claude/commands/clawvisor-install.md",
+		// The community `openclaw-cli` shim is NOT the install target;
+		// the real binary is `openclaw`.
+		"openclaw-cli",
+		// `openclaw onboard` is the first-time auth flow, not the path for
+		// adding a custom provider after install. Verified against
+		// docs.openclaw.ai/cli/onboard — onboard doesn't support idempotent
+		// re-runs for provider switching.
+		"openclaw onboard --non-interactive",
+		// Old per-agent models.json patch — there is no such file. All
+		// provider config lives in the global ~/.openclaw/openclaw.json.
+		"REMOTE_OPENCLAW_PATCH",
+		"OPENCLAW_MODELS_JSON",
+		"/agents/*/agent/models.json",
+		// --custom-compatibility used the wrong value (`anthropic` instead
+		// of `anthropic-messages`) — keep the door closed on that.
+		"--custom-compatibility anthropic --accept-risk",
+		// Per-provider literals would mean we baked the choice instead of
+		// deriving from the case block.
+		"## 2. Ensure a Anthropic key is vaulted",
+		"## 2. Ensure a OpenAI key is vaulted",
+		"OPENCLAW_MODEL_CONTEXT_WINDOW=200000",
+		"OPENCLAW_MODEL_CONTEXT_WINDOW=1000000",
 	} {
 		if strings.Contains(body, forbidden) {
-			t.Errorf("remote-mode body should not contain local-mode text %q", forbidden)
+			t.Errorf("OpenClaw one-paste skill should not contain %q", forbidden)
 		}
 	}
+}
+
+func TestInstallerOpenClawRendersAllModes(t *testing.T) {
+	// In the one-paste shape, mode (host / docker / remote) is no longer
+	// picked by the dashboard — the helper probes and picks at runtime, so
+	// the rendered markdown must contain command variants for all three.
+	// Provider is also no longer baked, so the per-mode snippets use the
+	// $BASE_PATH / $OPENCLAW_API shell vars instead of hardcoded literals.
+	h := NewInstallerHandler("", "", true, "", "")
+	body := installerGet(t, h, "openclaw", "CLAIMOPEN12")
+
+	assertContainsAll(t, body,
+		// Host: bare `openclaw config set` (no openclaw-cli; no onboard).
+		`openclaw config set models.providers.clawvisor "$PROVIDER_JSON" --strict-json --merge`,
+		// Docker: docker exec into the already-running container (probe
+		// captures its name as $OPENCLAW_CONTAINER), then `openclaw config
+		// set` inside the container against the mounted ~/.openclaw.
+		`docker exec "$OPENCLAW_CONTAINER" openclaw config set models.providers.clawvisor`,
+		"host.docker.internal:",
+		// Remote: ssh + stdin-piped JSON via $(cat) so the embedded double
+		// quotes don't fight with ssh argv quoting.
+		`ssh "$OPENCLAW_REMOTE" 'openclaw config set models.providers.clawvisor "$(cat)" --strict-json --merge'`,
+		"export OPENCLAW_CLAWVISOR_URL",
+		"$OPENCLAW_CLAWVISOR_URL$BASE_PATH",
+	)
 }
 
 // TestInstallerAllTargetsHaveFrontmatter — Codex rejects skills without YAML
 // frontmatter at load time; we caught this in the field after a real install,
 // so guard against regression by asserting the exact shape on every target.
-// Claude Code and Codex use the `clawvisor-setup` slash command (one-paste
-// connect existing CLI); Hermes and OpenClaw use `clawvisor-install` (install
-// a harness binary). Both names are accepted here — the test asserts the
-// frontmatter shape, not the specific name.
+// All four targets now use the `clawvisor-setup` slash command — the
+// one-paste shape (auto-approve claim → in-skill mint, configure, smoke
+// test, self-uninstall) is uniform across Claude Code, Codex, Hermes, and
+// OpenClaw.
 // uninstallGet hits the uninstall endpoint with a target + optional agent
 // name and returns the rendered markdown body. Mirrors installerGet.
 func uninstallGet(t *testing.T, h *InstallerHandler, target, agentName string) string {
@@ -771,8 +828,8 @@ func TestInstallerAllTargetsHaveFrontmatter(t *testing.T) {
 	wantName := map[string]string{
 		"claude-code": "clawvisor-setup",
 		"codex":       "clawvisor-setup",
-		"hermes":      "clawvisor-install",
-		"openclaw":    "clawvisor-install",
+		"hermes":      "clawvisor-setup",
+		"openclaw":    "clawvisor-setup",
 	}
 	for target, name := range wantName {
 		body := installerGet(t, h, target, "")
