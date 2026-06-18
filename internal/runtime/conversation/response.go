@@ -55,16 +55,27 @@ type ToolUseVerdict struct {
 	// the original method/path/body.
 	RewriteInput json.RawMessage
 
-	// ContinueWithToolResult is the legacy flattened continuation
-	// payload. New evaluators should set Continue instead; final
-	// adapter code should read ContinuationToolResultContent(), which
-	// prefers Continue and falls back to this field for compatibility.
-	ContinueWithToolResult string
-
-	// PrependAssistantNotice is the legacy flattened continuation
-	// notice. New evaluators should set Continue.PrependNotice instead;
-	// final adapter code should read ContinuationNotice().
-	PrependAssistantNotice string
+	// RecoverableReason marks the verdict as a recoverable-deny that
+	// the postproc eval wrapper transforms into the canonical
+	// placeholder + pending-substitution pattern. The reason text is
+	// what lands as the tool_result content on the next inbound
+	// /v1/messages; the original tool_use is restored byte-for-byte so
+	// the model sees its own call answered with the failure reason and
+	// can retry with a corrected shape. Used by RecoverableDenyVerdict
+	// callers — inspector parse errors, boundary check failures,
+	// credential rewrite errors, etc.
+	//
+	// Contract: this field is a PRODUCER → POSTPROC signal. Policy
+	// evaluators populate it; postproc.transformRecoverableDenyToPlaceholder
+	// (in the eval wrapper) consumes it and rewrites the verdict in
+	// place — clearing RecoverableReason and setting
+	// SubstituteWithToolCall + SuppressSubstituteText before any
+	// renderer sees the verdict. Response rewriters MUST NOT branch on
+	// this field; they only see the post-transform shape.
+	// SubstituteWith stays populated as a terminal fallback for the
+	// case where the registry isn't wired (e.g., test fixtures without
+	// AuthorizationContext.ScopeDrifts).
+	RecoverableReason string
 
 	// CreatedTaskID names the inline task created by the
 	// conversation auto-approval gate. Carried so downstream audit
@@ -81,12 +92,6 @@ type ToolUseVerdict struct {
 	// HoldKey groups sibling tool_uses for coalescing. Empty means
 	// "do not coalesce" (each Hold gets its own approval row).
 	HoldKey string
-
-	// Continue lifts continuation out of "mutation" into a control-flow
-	// signal. When set, the tool_use is being served locally and the
-	// pipeline re-enters with the synthetic continuation as the next
-	// request.
-	Continue *ContinueSignal
 
 	// Facts carries typed observations the evaluator emitted. Audit
 	// emission branches via type switch on Facts. Populated for EVERY
@@ -119,64 +124,6 @@ func MakeToolInputPreview(in json.RawMessage) string {
 		return s
 	}
 	return s[:toolInputPreviewLimit] + "..."
-}
-
-type ContinuationToolResult struct {
-	ToolUseID string
-	Content   string
-}
-
-// ContinuationToolResultContent returns the text payload a final
-// provider adapter should wrap in the provider-specific tool_result
-// shape. Structured Continue is canonical; ContinueWithToolResult is a
-// compatibility fallback for older call sites that have not migrated.
-func (v ToolUseVerdict) ContinuationToolResultContent() (string, bool) {
-	if v.Continue != nil {
-		text := continuationToolResultContent(v.Continue.SyntheticToolResults)
-		return text, true
-	}
-	if v.ContinueWithToolResult != "" {
-		return v.ContinueWithToolResult, true
-	}
-	return "", false
-}
-
-// ContinuationNotice returns the user-facing notice to prepend after a
-// successful continuation. Structured Continue is canonical; the flat
-// field is a compatibility fallback.
-func (v ToolUseVerdict) ContinuationNotice() string {
-	if v.Continue != nil && strings.TrimSpace(v.Continue.PrependNotice) != "" {
-		return v.Continue.PrependNotice
-	}
-	return v.PrependAssistantNotice
-}
-
-func continuationToolResultContent(results []json.RawMessage) string {
-	parts := make([]string, 0, len(results))
-	for _, raw := range results {
-		if len(raw) == 0 {
-			continue
-		}
-		var s string
-		if err := json.Unmarshal(raw, &s); err == nil {
-			parts = append(parts, s)
-			continue
-		}
-		var obj map[string]json.RawMessage
-		if err := json.Unmarshal(raw, &obj); err != nil {
-			continue
-		}
-		if content, ok := obj["content"]; ok {
-			if err := json.Unmarshal(content, &s); err == nil {
-				parts = append(parts, s)
-				continue
-			}
-			parts = append(parts, string(content))
-			continue
-		}
-		parts = append(parts, string(raw))
-	}
-	return strings.Join(parts, "\n")
 }
 
 type StreamingRewriteResult struct {
@@ -319,11 +266,41 @@ func applyBlockSubstitutions(frags []assistantFragment, decisions []ToolUseDecis
 		decision := decisions[toolDecisionIdx]
 		toolDecisionIdx++
 		if !decision.Verdict.Allowed {
+			if decision.Verdict.SubstituteWithToolCall != nil &&
+				frag.ToolName == decision.Verdict.SubstituteWithToolCall.Name {
+				// Placeholder substitution (scope-drift, recoverable-
+				// deny, auto-approve) rendered as a synthetic tool_use
+				// on the wire: the rewriter populated frag.ToolName
+				// with the substitute's Name, so the match confirms the
+				// wire actually carries the tool_use shape. Pass the
+				// fragment through unchanged so the AssistantTurn audit
+				// matches. Any preamble SubstituteWith text was
+				// emitted as its own preceding Text frag by the
+				// rewriter and passes through above.
+				out = append(out, frag)
+				continue
+			}
+			// Reaches here when either (a) no SubstituteWithToolCall
+			// was set, or (b) one was set but the wire-side renderer
+			// (anthropicSubstituteToolUseBlock / emitOpenAIResponsesSubstitute)
+			// returned ok=false and the rewriter fell back to a text
+			// content block — leaving the trailing frag with the
+			// ORIGINAL tool name. The wire-side fallback mirrors the
+			// text-derivation rules below (SubstituteWith → policy
+			// default → suppression unless paired with a
+			// SubstituteWithToolCall escape hatch), so re-apply the
+			// same precedence here to keep audit shape aligned with
+			// the wire.
 			if substitute := strings.TrimSpace(decision.Verdict.SubstituteWith); substitute != "" {
 				out = append(out, assistantFragment{Text: substitute})
 				continue
 			}
-			if decision.Verdict.SuppressSubstituteText {
+			// SuppressSubstituteText only silences when there's no
+			// SubstituteWithToolCall fallback in play. When a fallback
+			// IS in play, the wire emits a default policy notice
+			// (escape hatch in the per-provider rewriters); the audit
+			// follows suit.
+			if decision.Verdict.SuppressSubstituteText && decision.Verdict.SubstituteWithToolCall == nil {
 				continue
 			}
 			reason := decision.Verdict.Reason

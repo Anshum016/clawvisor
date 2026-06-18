@@ -10,7 +10,6 @@ import (
 
 	"github.com/clawvisor/clawvisor/internal/runtime/conversation"
 	"github.com/clawvisor/clawvisor/internal/runtime/llmproxy/controltool"
-	"github.com/clawvisor/clawvisor/internal/runtime/llmproxy/jsonsurgery"
 	runtimepolicy "github.com/clawvisor/clawvisor/internal/runtime/policy"
 	runtimetasks "github.com/clawvisor/clawvisor/internal/runtime/tasks"
 	"github.com/clawvisor/clawvisor/internal/taskrisk"
@@ -215,6 +214,41 @@ func MaybeInterceptInlineTaskDefinition(
 		)
 	}
 	if ok {
+		// Pre-flight registry + identity check. The auto-approve
+		// verdict's placeholder relies on the inbound rewriter
+		// restoring the original control-tool POST on the next
+		// /v1/messages, which requires a pending substitution in the
+		// registry keyed by (AgentID, ConversationID, ToolUseID). If
+		// any of those identifiers is missing the substitution can't
+		// be keyed safely:
+		//
+		//   - Registry unwired: no restoration record possible at all.
+		//   - AgentID empty: registry refuses the write (required
+		//     field). Fall back rather than fail the request.
+		//   - ConversationID empty: keys collapse across concurrent
+		//     conversations from the same agent, so a second
+		//     conversation's placeholder could shadow the first
+		//     (model history corruption is worse than the cost of
+		//     the human-prompt round-trip).
+		//
+		// Production wiring populates all three; the gate only fires
+		// in test fixtures or partially-configured deployments.
+		switch {
+		case cfg.AuthorizationContext.ScopeDrifts == nil:
+			audit("fallthrough", "auto_approve_registry_unavailable", "scope-drift registry not wired; cannot register placeholder substitution")
+			trace("inline_task.auto_approve_registry_unavailable")
+			ok = false
+		case cfg.AgentID == "":
+			audit("fallthrough", "auto_approve_agent_id_missing", "agent id empty; substitution key would be unsound")
+			trace("inline_task.auto_approve_agent_id_missing")
+			ok = false
+		case cfg.ConversationID == "":
+			audit("fallthrough", "auto_approve_conversation_id_missing", "conversation id empty; substitution key would collide across concurrent conversations")
+			trace("inline_task.auto_approve_conversation_id_missing")
+			ok = false
+		}
+	}
+	if ok {
 		if cfg.InlineTaskCreator == nil {
 			// Threshold says "approve" but the runtime cannot create
 			// the task without prompting (no creator wired). Fall
@@ -312,29 +346,109 @@ func MaybeInterceptInlineTaskDefinition(
 					"reason", reason,
 				)
 				augmentation := inlineApprovedReplyAugmentationContext(created.ID, checkedOut, created.Credentials)
-				continuationPayload, _ := jsonsurgery.MarshalNoEscape(augmentation)
+				sentinel := &conversation.SyntheticToolCall{
+					ID:   tu.ID,
+					Name: ScopeDriftPlaceholderToolName,
+					Input: map[string]any{
+						"command": BuildAutoApprovePlaceholderCommand(tu.Name, created.ID, created.Purpose),
+					},
+				}
+				// Register a pending substitution so the inbound
+				// rewriter on the next /v1/messages restores the
+				// model's original control_tool POST byte-for-byte and
+				// delivers the augmentation context as the
+				// tool_result. The harness sees the model emit a
+				// `Bash` no-op carrying the operator-facing
+				// auto-approve comment; the upstream model sees its
+				// own call answered by the augmentation. Same wire
+				// mechanism as scope-drift / recoverable-deny — see
+				// scope_drift_inbound_rewrite.go.
+				//
+				// Design tradeoff (vs. the pre-Jul-2026 upstream
+				// continuation path): the conversation now resumes on
+				// the harness's NEXT inbound request rather than via a
+				// proxy-issued synthetic upstream call. That costs one
+				// extra harness round-trip and surfaces the placeholder
+				// no-op in the user-visible transcript, but unifies
+				// every blocked-/auto-approved scenario onto a single
+				// mechanism and keeps model+harness history in lockstep
+				// (continuation hid the create_task call from the
+				// harness while keeping it in the model's working
+				// context — a subtle desync). Accepted explicitly in the
+				// PR that landed this migration.
+				// Registry presence is enforced by the pre-flight gate
+				// at the top of the auto-approve branch, so this call
+				// site doesn't repeat the nil check.
+				registry := cfg.AuthorizationContext.ScopeDrifts
+				if regErr := registry.RegisterPendingSubstitution(req.Context(),
+					PendingSubstitutionKey{
+						AgentID:        cfg.AgentID,
+						ConversationID: cfg.ConversationID,
+						ToolUseID:      tu.ID,
+					},
+					PendingSubstitution{
+						MenuText:          augmentation,
+						OriginalToolName:  tu.Name,
+						OriginalToolInput: append([]byte(nil), tu.Input...),
+					},
+				); regErr != nil {
+					// Registration failure after the task was already
+					// created would leave an orphan active task — the
+					// model never received a record of the create call
+					// (no inbound substitution to restore it), so the
+					// agent will keep retrying with no awareness that
+					// the task exists. Roll the task back via
+					// InlineApprovedTaskExpirer so the audit trail and
+					// the dashboard reflect what actually happened.
+					// Detached context with a short timeout because a
+					// mid-request client disconnect (a plausible cause
+					// of cache misbehavior) must not cancel the
+					// rollback and strand the orphan for the full TTL.
+					if expirer, ok := cfg.InlineTaskCreator.(InlineApprovedTaskExpirer); ok {
+						rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(req.Context()), 5*time.Second)
+						if expireErr := expirer.ExpireInlineApprovedTask(rollbackCtx, created.ID, cfg.AgentUserID); expireErr != nil {
+							trace("inline_task.auto_approve_rollback_failed", "task_id", created.ID, "err", expireErr.Error())
+						}
+						cancel()
+					} else {
+						// The creator implementation predates the
+						// rollback interface; we can't undo. Log the
+						// orphan so operators can investigate.
+						trace("inline_task.auto_approve_rollback_unavailable", "task_id", created.ID, "reason", "InlineTaskCreator does not implement InlineApprovedTaskExpirer")
+					}
+					audit("fallthrough", "auto_approve_substitution_register_failed", regErr.Error()+"; task "+created.ID+" was rolled back via ExpireInlineApprovedTask")
+					trace("inline_task.auto_approve_substitution_failed", "err", regErr.Error(), "rolled_back_task_id", created.ID)
+					// Returning false also lets the deferred guard.Rollback
+					// (from PR #569's drift-claim machinery) revert the
+					// drift claim alongside the registration failure.
+					return conversation.ToolUseVerdict{}, false
+				}
+				// Drift-claim success: the deferred Rollback is now a
+				// no-op. Mirrors the placement in PR #569's continuation
+				// path.
 				guard.Success()
 				return conversation.ToolUseVerdict{
+					Outcome: conversation.OutcomeDeny,
 					Allowed: false,
 					Reason:  "Clawvisor: auto-approved from conversation context",
 					// CreatedTaskID lets downstream audit emissions
-					// (LogContinuationSkippedSiblingTools etc.) link
-					// to the same task without parsing the
+					// link to the same task without parsing the
 					// augmentation text or threading a sidecar map.
-					CreatedTaskID: created.ID,
-					// SubstituteWith is the fallback rendered to the
-					// harness as an assistant text turn if the handler
-					// can't complete the recursive continuation call
-					// (unsupported provider, recursion bound reached,
-					// upstream error). Continue is the happy path: the
-					// handler feeds this same text back upstream as a
-					// synthetic user/tool_result turn so the model can
-					// proceed without bouncing to the user.
-					SubstituteWith: augmentation,
-					Continue: &conversation.ContinueSignal{
-						SyntheticToolResults: []json.RawMessage{continuationPayload},
-						PrependNotice:        AutoApproveUserNotice(created.Purpose),
-					},
+					CreatedTaskID:          created.ID,
+					SubstituteWithToolCall: sentinel,
+					// SubstituteWith carries the user-facing
+					// [Clawvisor] notice. The response rewriters emit
+					// it as a leading text/message block alongside the
+					// Bash placeholder so the harness's transcript
+					// shows what just happened ("auto-approved task
+					// X"). The model's view of subsequent turns
+					// includes the notice text in its prior assistant
+					// turn, which is accurate context — the placeholder
+					// tool_use itself is restored to the original
+					// control-tool POST by the inbound rewriter, so
+					// the model sees its own call + the notice + the
+					// augmentation as the tool_result.
+					SubstituteWith: AutoApproveUserNotice(created.Purpose),
 				}, true
 			}
 		}

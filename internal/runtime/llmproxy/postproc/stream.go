@@ -151,39 +151,6 @@ func PostprocessStream(
 		}, nil
 	}
 
-	var continuationResults []conversation.ContinuationToolResult
-	for _, dec := range decisions {
-		if content, ok := dec.Verdict.ContinuationToolResultContent(); ok {
-			continuationResults = append(continuationResults, conversation.ContinuationToolResult{
-				ToolUseID: dec.ToolUse.ID,
-				Content:   content,
-			})
-		}
-	}
-
-	// Continuation only fires when every tool_use in the turn has a
-	// synthetic tool_result — Anthropic/OpenAI both 400 on an
-	// unbalanced tool_use/tool_result count, so the handler's
-	// tryContinuation skips the upstream call on a mismatch. Returning
-	// early with ContinuationToolResults populated when the 1:1
-	// invariant won't hold would leave the buffered tool_use blocks
-	// unwritten (StreamRewrite withholds them until the substitute or
-	// tool_use writer fires) and the harness would receive a truncated
-	// stream. Fall through to the substitute path so the wire carries
-	// a clean blocked-prompt turn in the mixed-recoverable-sibling
-	// case, mirroring the handler's own 1:1 check earlier in the flow.
-	if len(continuationResults) > 0 && len(continuationResults) == len(decisions) {
-		return llmproxy.PostprocessResult{
-			ContentType:             contentType,
-			Rewritten:               true,
-			Decisions:               decisions,
-			ContinuationToolResults: continuationResults,
-			AssistantTurn:           streamResult.AssistantTurn,
-			StreamingProvider:       provider,
-			StreamingResult:         streamResult,
-		}, nil
-	}
-
 	if anyBlocked {
 		// Tool-call substitution path: when every blocked decision
 		// supplies a SubstituteWithToolCall, the streaming codec emits
@@ -592,12 +559,11 @@ func mapFromRawJSON(raw json.RawMessage) map[string]any {
 // order. No response.created / response.completed envelope (the
 // upstream already wrote those).
 func writeOpenAIResponsesSubstituteToolCalls(w io.Writer, result conversation.StreamingRewriteResult, blocks []mixedTurnBlock) error {
-	startIdx := result.NextOpenAIOutputIndex
-	if startIdx < 0 {
-		startIdx = 0
+	outputIndex := result.NextOpenAIOutputIndex
+	if outputIndex < 0 {
+		outputIndex = 0
 	}
-	for i, blk := range blocks {
-		outputIndex := startIdx + i
+	for _, blk := range blocks {
 		var (
 			callID string
 			name   string
@@ -627,6 +593,16 @@ func writeOpenAIResponsesSubstituteToolCalls(w io.Writer, result conversation.St
 				return err
 			}
 			args = marshalled
+			// Notice preamble: when SubstituteWith was paired with the
+			// substitute tool_call (auto-approve), emit it as a
+			// leading message item so the harness's transcript shows
+			// the [Clawvisor] notice alongside the placeholder.
+			if preamble := strings.TrimSpace(blk.Substitute.Text); preamble != "" {
+				if err := writeOpenAIResponsesNoticeMessageItem(w, outputIndex, callID, blk.Substitute.Text); err != nil {
+					return err
+				}
+				outputIndex++
+			}
 		} else {
 			continue
 		}
@@ -675,10 +651,62 @@ func writeOpenAIResponsesSubstituteToolCalls(w io.Writer, result conversation.St
 		}); err != nil {
 			return err
 		}
+		outputIndex++
 	}
 	return writeSSE(w, "response.completed", map[string]any{
 		"type":     "response.completed",
 		"response": map[string]any{"id": "resp_clawvisor_substitute", "status": "completed"},
+	})
+}
+
+// writeOpenAIResponsesNoticeMessageItem emits the SSE event triple for
+// a leading `message` output item carrying the notice text. Mirrors
+// the Anthropic substitute writer's text-content_block preamble.
+func writeOpenAIResponsesNoticeMessageItem(w io.Writer, outputIndex int, callID, text string) error {
+	itemID := "msg_" + callID + "_notice"
+	if err := writeSSE(w, "response.output_item.added", map[string]any{
+		"type":         "response.output_item.added",
+		"output_index": outputIndex,
+		"item": map[string]any{
+			"id":     itemID,
+			"type":   "message",
+			"role":   "assistant",
+			"status": "in_progress",
+		},
+	}); err != nil {
+		return err
+	}
+	if err := writeSSE(w, "response.output_text.delta", map[string]any{
+		"type":          "response.output_text.delta",
+		"item_id":       itemID,
+		"output_index":  outputIndex,
+		"content_index": 0,
+		"delta":         text,
+	}); err != nil {
+		return err
+	}
+	if err := writeSSE(w, "response.output_text.done", map[string]any{
+		"type":          "response.output_text.done",
+		"item_id":       itemID,
+		"output_index":  outputIndex,
+		"content_index": 0,
+		"text":          text,
+	}); err != nil {
+		return err
+	}
+	return writeSSE(w, "response.output_item.done", map[string]any{
+		"type":         "response.output_item.done",
+		"output_index": outputIndex,
+		"item": map[string]any{
+			"id":     itemID,
+			"type":   "message",
+			"role":   "assistant",
+			"status": "completed",
+			"content": []map[string]any{{
+				"type": "output_text",
+				"text": text,
+			}},
+		},
 	})
 }
 
@@ -690,6 +718,7 @@ func writeOpenAIResponsesSubstituteToolCalls(w io.Writer, result conversation.St
 // tool_calls delta and a stop fragment.
 func writeOpenAIChatSubstituteToolCalls(w io.Writer, _ conversation.StreamingRewriteResult, blocks []mixedTurnBlock) error {
 	toolCalls := make([]map[string]any, 0, len(blocks))
+	var noticeTexts []string
 	for i, blk := range blocks {
 		var (
 			callID string
@@ -720,6 +749,15 @@ func writeOpenAIChatSubstituteToolCalls(w io.Writer, _ conversation.StreamingRew
 				return err
 			}
 			args = marshalled
+			// Notice preamble: collect SubstituteWith text from every
+			// substitute block and concatenate them into the
+			// assistant message's `content` field on the same chunk
+			// that carries the tool_calls delta. Chat Completions has
+			// no separate "preamble message item" surface — content
+			// and tool_calls share the same assistant message.
+			if preamble := strings.TrimSpace(blk.Substitute.Text); preamble != "" {
+				noticeTexts = append(noticeTexts, blk.Substitute.Text)
+			}
 		} else {
 			continue
 		}
@@ -733,10 +771,14 @@ func writeOpenAIChatSubstituteToolCalls(w io.Writer, _ conversation.StreamingRew
 			},
 		})
 	}
+	delta := map[string]any{"tool_calls": toolCalls}
+	if len(noticeTexts) > 0 {
+		delta["content"] = strings.Join(noticeTexts, "\n\n")
+	}
 	deltaChunk := map[string]any{
 		"id":      "chatcmpl_clawvisor_substitute",
 		"object":  "chat.completion.chunk",
-		"choices": []map[string]any{{"index": 0, "delta": map[string]any{"tool_calls": toolCalls}}},
+		"choices": []map[string]any{{"index": 0, "delta": delta}},
 	}
 	deltaBytes, err := json.Marshal(deltaChunk)
 	if err != nil {

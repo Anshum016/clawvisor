@@ -22,20 +22,120 @@ func (OpenAIResponseRewriter) MatchesResponse(req *http.Request, resp *http.Resp
 }
 
 func (rw OpenAIResponseRewriter) Rewrite(body []byte, contentType string, eval ToolUseEvaluator) (RewriteResult, error) {
-	switch {
-	case isOpenAIChatCompletionsEndpointFromBody(contentType, body):
+	switch OpenAIResponseShape(contentType, body) {
+	case OpenAIResponseShapeChat:
 		return rw.rewriteChatCompletions(body, contentType, eval)
-	case isOpenAIResponsesBody(body):
+	case OpenAIResponseShapeResponses:
 		return rw.rewriteResponses(body, contentType, eval)
 	default:
-		if isSSE(contentType) || looksLikeSSE(body) {
-			if bytes.Contains(body, []byte("response.output_item.added")) || bytes.Contains(body, []byte("response.function_call_arguments")) {
-				return rw.rewriteResponses(body, contentType, eval)
-			}
-			return rw.rewriteChatCompletions(body, contentType, eval)
-		}
 		return RewriteResult{Body: body}, nil
 	}
+}
+
+// OpenAIResponseShapeKind discriminates Chat Completions from the
+// Responses API at the response-body level. Used by every layer that
+// needs to choose between the two providers' wire formats —
+// dispatching rewriters, prepending the [Clawvisor] notice,
+// classifying inbound streams, etc. Centralizing here keeps the
+// wire-format knowledge in one file rather than scattered across
+// callers.
+type OpenAIResponseShapeKind int
+
+const (
+	OpenAIResponseShapeUnknown OpenAIResponseShapeKind = iota
+	OpenAIResponseShapeChat
+	OpenAIResponseShapeResponses
+)
+
+// OpenAIResponseShape classifies a response body as Chat Completions
+// vs Responses API. For buffered JSON it parses the top-level
+// `choices` / `output` / `object` fields. For SSE it inspects the
+// first event's prefix line — Responses always emits `event: response.X`
+// on every event, Chat Completions never sets the event: field —
+// which is a stable wire-envelope discriminator that can't be
+// falsified by model-authored content.
+//
+// Unknown is returned when the body shape doesn't match either
+// provider (e.g., a non-OpenAI body routed through the dispatch by
+// mistake, or an unrecognized SSE stream).
+func OpenAIResponseShape(contentType string, body []byte) OpenAIResponseShapeKind {
+	if isSSE(contentType) || looksLikeSSE(body) {
+		return openAIStreamShape(body)
+	}
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(body, &probe); err != nil {
+		return OpenAIResponseShapeUnknown
+	}
+	if _, ok := probe["choices"]; ok {
+		return OpenAIResponseShapeChat
+	}
+	if _, ok := probe["output"]; ok {
+		return OpenAIResponseShapeResponses
+	}
+	// `object` is the legacy disambiguator: object="chat.completion"
+	// for Chat, object="response" for Responses. Fall back to it when
+	// neither top-level array is present.
+	if rawObj, ok := probe["object"]; ok {
+		var obj string
+		if err := json.Unmarshal(rawObj, &obj); err == nil {
+			switch obj {
+			case "chat.completion", "chat.completion.chunk":
+				return OpenAIResponseShapeChat
+			case "response":
+				return OpenAIResponseShapeResponses
+			}
+		}
+	}
+	return OpenAIResponseShapeUnknown
+}
+
+// openAIStreamShape inspects the first SSE event block to classify
+// the stream. Responses always emits event: response.<type> on every
+// event; Chat Completions has no event: lines, just anonymous data:
+// lines. First-event discrimination is sufficient because the
+// envelope shape is consistent across the whole stream.
+func openAIStreamShape(body []byte) OpenAIResponseShapeKind {
+	normalized := strings.ReplaceAll(string(body), "\r\n", "\n")
+	for _, block := range strings.Split(normalized, "\n\n") {
+		block = strings.TrimSpace(block)
+		if block == "" {
+			continue
+		}
+		var eventName, dataLine string
+		for _, line := range strings.Split(block, "\n") {
+			switch {
+			case strings.HasPrefix(line, "event:"):
+				eventName = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+			case strings.HasPrefix(line, "data:"):
+				dataLine = strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			}
+		}
+		if strings.HasPrefix(eventName, "response.") {
+			return OpenAIResponseShapeResponses
+		}
+		if eventName != "" {
+			// Non-response.* event prefix — probably Anthropic or
+			// another shape. Walk to the next event.
+			continue
+		}
+		// Chat: data line carries the chat.completion.chunk envelope.
+		if dataLine == "" || dataLine == "[DONE]" {
+			continue
+		}
+		var probe struct {
+			Object string `json:"object"`
+		}
+		if err := json.Unmarshal([]byte(dataLine), &probe); err != nil {
+			continue
+		}
+		switch probe.Object {
+		case "chat.completion", "chat.completion.chunk":
+			return OpenAIResponseShapeChat
+		case "response":
+			return OpenAIResponseShapeResponses
+		}
+	}
+	return OpenAIResponseShapeUnknown
 }
 
 // rewriteResponses picks the SSE vs JSON path. Content-Type is the primary
@@ -96,6 +196,86 @@ type openAIResponseOutputItem struct {
 type openAIResponseContent struct {
 	Type string `json:"type"`
 	Text string `json:"text,omitempty"`
+}
+
+// emitOpenAIResponsesSubstitute packages the (preamble, substitute
+// function_call) pair into the OpenAI Responses output-item shape.
+// Centralizes the SubstituteWith + SubstituteWithToolCall contract
+// the buffered JSON and SSE rewriters share — the rewriter sites are
+// per-block-shape (struct field vs ordered slice), but the wire
+// emission policy lives here. Returns (items, frags, true) on success;
+// (nil, nil, false) when the substitute call can't render. The
+// preamble item is omitted when preamble is whitespace-only.
+func emitOpenAIResponsesSubstitute(originalToolUseID, preamble string, call *SyntheticToolCall) ([]openAIResponseOutputItem, []assistantFragment, bool) {
+	substItem, substArgs, ok := buildOpenAIResponsesSubstituteFunctionCall(originalToolUseID, call)
+	if !ok {
+		return nil, nil, false
+	}
+	var items []openAIResponseOutputItem
+	var frags []assistantFragment
+	if p := strings.TrimSpace(preamble); p != "" {
+		items = append(items, openAIResponseOutputItem{
+			ID:     "msg_" + originalToolUseID + "_notice",
+			Type:   "message",
+			Role:   "assistant",
+			Status: "completed",
+			Content: []openAIResponseContent{{
+				Type: "output_text",
+				Text: preamble,
+			}},
+		})
+		frags = append(frags, assistantFragment{Text: preamble})
+	}
+	items = append(items, substItem)
+	frags = append(frags, assistantFragment{IsTool: true, ToolName: call.Name, ToolArgs: substArgs})
+	return items, frags, true
+}
+
+// applyOpenAIChatSubstitute mutates the tool_call in-place to carry
+// the substitute name + arguments, returns the assistant fragment for
+// the audit trail, and (when preamble is non-empty) returns the
+// notice text the choice-level renderer should fold into Content.
+// Returns ok=false when the substitute call can't render.
+func applyOpenAIChatSubstitute(call *openAIChatToolCall, preamble string, scall *SyntheticToolCall) (assistantFragment, string, bool) {
+	substArgs, ok := marshalSyntheticToolCallInput(scall)
+	if !ok {
+		return assistantFragment{}, "", false
+	}
+	call.Function.Name = scall.Name
+	call.Function.Arguments = string(substArgs)
+	frag := assistantFragment{IsTool: true, ToolName: scall.Name, ToolArgs: substArgs}
+	if strings.TrimSpace(preamble) != "" {
+		return frag, preamble, true
+	}
+	return frag, "", true
+}
+
+// appendOpenAIResponsesSubstituteOrdered is the SSE counterpart to
+// emitOpenAIResponsesSubstitute: it folds the (preamble, substitute)
+// pair onto the orderedResponsesItem slice the buffered SSE rewriter
+// builds and re-emits via buildOpenAIResponsesMultiSSE.
+func appendOpenAIResponsesSubstituteOrdered(items []orderedResponsesItem, frags []assistantFragment, outputIndex int, itemID, callID, preamble string, call *SyntheticToolCall) ([]orderedResponsesItem, []assistantFragment, bool) {
+	substArgs, ok := marshalSyntheticToolCallInput(call)
+	if !ok {
+		return items, frags, false
+	}
+	if p := strings.TrimSpace(preamble); p != "" {
+		items = append(items, orderedResponsesItem{
+			isText:      true,
+			outputIndex: outputIndex,
+			text:        preamble,
+		})
+		frags = append(frags, assistantFragment{Text: preamble})
+	}
+	items = append(items, orderedResponsesItem{
+		outputIndex: outputIndex,
+		itemID:      itemID,
+		callID:      callID,
+		name:        call.Name,
+		arguments:   string(substArgs),
+	})
+	frags = append(frags, assistantFragment{IsTool: true, ToolName: call.Name, ToolArgs: substArgs})
+	return items, frags, true
 }
 
 // buildOpenAIResponsesSubstituteFunctionCall renders a function_call
@@ -168,9 +348,9 @@ func (rw OpenAIResponseRewriter) rewriteResponsesJSON(body []byte, eval ToolUseE
 				// function_call_output content.
 				substRendered := false
 				if call := verdict.SubstituteWithToolCall; call != nil && call.Name != "" {
-					if substItem, substArgs, ok := buildOpenAIResponsesSubstituteFunctionCall(tu.ID, call); ok {
-						newOutput = append(newOutput, substItem)
-						frags = append(frags, assistantFragment{IsTool: true, ToolName: call.Name, ToolArgs: substArgs})
+					if items, addFrags, ok := emitOpenAIResponsesSubstitute(tu.ID, verdict.SubstituteWith, call); ok {
+						newOutput = append(newOutput, items...)
+						frags = append(frags, addFrags...)
 						substRendered = true
 					}
 				}
@@ -450,15 +630,9 @@ func (rw OpenAIResponseRewriter) rewriteResponsesSSE(body []byte, eval ToolUseEv
 					// function_call_output content with the menu.
 					substRendered := false
 					if call := verdict.SubstituteWithToolCall; call != nil && call.Name != "" {
-						if substArgs, ok := marshalSyntheticToolCallInput(call); ok {
-							orderedItems = append(orderedItems, orderedResponsesItem{
-								outputIndex: pc.outputIndex,
-								itemID:      pc.itemID,
-								callID:      pc.callID,
-								name:        call.Name,
-								arguments:   string(substArgs),
-							})
-							frags = append(frags, assistantFragment{IsTool: true, ToolName: call.Name, ToolArgs: substArgs})
+						if updated, addFrags, ok := appendOpenAIResponsesSubstituteOrdered(orderedItems, frags, pc.outputIndex, pc.itemID, pc.callID, verdict.SubstituteWith, call); ok {
+							orderedItems = updated
+							frags = addFrags
 							delete(pending, raw.Item.ID)
 							substRendered = true
 						}
@@ -867,15 +1041,20 @@ func (rw OpenAIResponseRewriter) rewriteChatCompletionsJSON(body []byte, eval To
 				// message content with the menu.
 				substRendered := false
 				if scall := verdict.SubstituteWithToolCall; scall != nil && scall.Name != "" {
-					if substArgs, ok := marshalSyntheticToolCallInput(scall); ok {
-						call.Function.Name = scall.Name
-						call.Function.Arguments = string(substArgs)
+					if frag, notice, ok := applyOpenAIChatSubstitute(&call, verdict.SubstituteWith, scall); ok {
 						choice.Message.ToolCalls[i] = call
-						finalArgs = substArgs
+						// finalArgs records the substitute's args for
+						// the choice-level audit fragment below;
+						// frag.ToolArgs already holds the marshaled
+						// bytes the helper produced.
+						finalArgs = frag.ToolArgs
 						choiceRewritten = true
 						anyRewritten = true
 						allowedToolCalls = append(allowedToolCalls, call)
-						frags = append(frags, assistantFragment{IsTool: true, ToolName: scall.Name, ToolArgs: substArgs})
+						frags = append(frags, frag)
+						if notice != "" {
+							blockedPrompts = append(blockedPrompts, notice)
+						}
 						substRendered = true
 					}
 				}
@@ -1800,17 +1979,6 @@ func sseEventBlock(event string, data any) string {
 func chatCompletionSSEBlock(data any) string {
 	raw, _ := json.Marshal(data)
 	return "data: " + string(raw) + "\n\n"
-}
-
-func isOpenAIResponsesBody(body []byte) bool {
-	return bytes.Contains(body, []byte(`"output"`)) || bytes.Contains(body, []byte(`response.output_item.added`))
-}
-
-func isOpenAIChatCompletionsEndpointFromBody(contentType string, body []byte) bool {
-	if isSSE(contentType) {
-		return !bytes.Contains(body, []byte(`response.output_item.added`))
-	}
-	return bytes.Contains(body, []byte(`"choices"`))
 }
 
 func stringifyOpenAIArguments(v any) string {
