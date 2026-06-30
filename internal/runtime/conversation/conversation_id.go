@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"net/http"
+	"regexp"
 	"strings"
 )
 
@@ -14,31 +15,38 @@ import (
 // sharing a Clawvisor token (Conductor workspaces, sub-agents, multiple chat
 // sessions in the same harness) don't clobber each other's approvals or focus.
 //
-// Returns "" when no identifier can be derived. Callers must treat empty as
-// "unknown conversation" and fall back to the pre-conversation-scoping
-// behavior — empty IDs MUST collide rather than partition, otherwise old
-// clients silently lose their previous-turn state on every request.
+// Returns "" only when the body has no user-authored turn at all (parse error,
+// empty messages array, no user-role entry). For any request that carries a
+// user message, ConversationID returns a non-empty id. Per-conversation
+// isolation depends on this: a "" return used to mean "fall back to a shared
+// (user, agent) bucket," which was the cross-conversation leak source.
 //
-// Identifier source per provider:
+// Decision order per provider (first non-empty wins):
 //
-//   - Anthropic (/v1/messages): body.metadata.user_id is a JSON-encoded blob
-//     of the shape {device_id, account_uuid, session_id}. Returns session_id.
-//     Stable per Claude Code session.
+//  1. Native session identifier on the wire (provider-specific).
+//  2. Clawvisor-minted marker (`cv-conv-...`) echoed back in assistant
+//     history. Minted by the handler on turn 1 when (1) is absent and
+//     prepended to the first assistant response via
+//     RenderAgentRoutingNotice; recovered here via FindInjectedConversationID.
+//     The marker is the compaction-tolerant id: when paired with the
+//     summarizer preservation directive in InjectControlNoticeWithSnapshot,
+//     it survives summarizer-based compaction at >>fingerprint rate.
+//  3. Fingerprint of the first user message — last-resort fallback for
+//     pre-mint turns (rare race), mint failures (crypto/rand outage), or
+//     harnesses that strip the marker before echoing.
 //
-//   - OpenAI Responses (/v1/responses): body.prompt_cache_key, a UUID-shaped
-//     value Codex sets so OpenAI's prompt cache matches across turns. Stable
-//     per Codex session.
+// Native sources per provider:
+//
+//   - Anthropic (/v1/messages): body.metadata.user_id is a JSON-encoded
+//     blob of the shape {device_id, account_uuid, session_id}. Returns
+//     session_id. Stable per Claude Code session.
+//
+//   - OpenAI Responses (/v1/responses): body.prompt_cache_key, a UUID-
+//     shaped value Codex sets so OpenAI's prompt cache matches across
+//     turns. Stable per Codex session.
 //
 //   - OpenAI Chat Completions (/v1/chat/completions): no native session
-//     identifier exists on the wire. First consult FindInjectedConversationID
-//     for a Clawvisor-minted marker echoed back in assistant history. Fall
-//     back to a fingerprint of the FIRST user message text when no marker
-//     has been minted yet (or the harness stripped it). The first user
-//     message is the most stable thing harnesses leave alone — system
-//     prompts can be rewritten on policy changes, and compaction replaces
-//     middle messages, but the first user-typed turn survives. Two
-//     conversations starting with literally identical text will collide
-//     under the fingerprint; the marker, when echoed, partitions cleanly.
+//     identifier exists on the wire — marker / fingerprint only.
 //
 // The request shape is inspected without disturbing it — body is read-only.
 func ConversationID(req *http.Request, provider Provider, body []byte) string {
@@ -47,26 +55,36 @@ func ConversationID(req *http.Request, provider Provider, body []byte) string {
 	}
 	switch provider {
 	case ProviderAnthropic:
-		return anthropicConversationID(body)
+		if id := anthropicNativeConversationID(body); id != "" {
+			return id
+		}
+		if id := FindInjectedConversationID(req, ProviderAnthropic, body); id != "" {
+			return id
+		}
+		return anthropicChatFingerprint(body)
 	case ProviderOpenAI:
 		if req != nil && isOpenAIChatCompletionsEndpoint(req) {
-			// Echoed Clawvisor marker is conclusive when present — it
-			// was minted on turn 1 specifically because no native ID
-			// exists, and the harness has now round-tripped it.
 			if id := FindInjectedConversationID(req, ProviderOpenAI, body); id != "" {
 				return id
 			}
-			// Pre-mint or marker-stripped fallback. Will be removed in
-			// a follow-up once telemetry confirms the marker round-trips
-			// reliably across the active OpenClaw harness population.
 			return openAIChatFingerprint(body)
 		}
-		return openAIResponsesConversationID(body)
+		if id := openAIResponsesNativeConversationID(body); id != "" {
+			return id
+		}
+		if id := FindInjectedConversationID(req, ProviderOpenAI, body); id != "" {
+			return id
+		}
+		return openAIResponsesFingerprint(body)
 	}
 	return ""
 }
 
-func anthropicConversationID(body []byte) string {
+// anthropicNativeConversationID returns the session id from
+// metadata.user_id (Claude Code's convention) or "" when no native id
+// is on the wire. Native-only — callers compose with marker echo and
+// fingerprint via ConversationID().
+func anthropicNativeConversationID(body []byte) string {
 	var probe struct {
 		Metadata struct {
 			UserID string `json:"user_id"`
@@ -80,8 +98,8 @@ func anthropicConversationID(body []byte) string {
 		return ""
 	}
 	// Claude Code encodes metadata.user_id as a JSON string that itself
-	// contains a JSON object. Tolerate either shape: nested object, or a
-	// flat opaque string.
+	// contains a JSON object. Tolerate either shape: nested object, or
+	// a flat opaque string.
 	var nested struct {
 		SessionID string `json:"session_id"`
 	}
@@ -93,7 +111,9 @@ func anthropicConversationID(body []byte) string {
 	return ""
 }
 
-func openAIResponsesConversationID(body []byte) string {
+// openAIResponsesNativeConversationID returns prompt_cache_key (Codex's
+// convention) or "" when no native id is on the wire.
+func openAIResponsesNativeConversationID(body []byte) string {
 	var probe struct {
 		PromptCacheKey string `json:"prompt_cache_key"`
 	}
@@ -101,6 +121,203 @@ func openAIResponsesConversationID(body []byte) string {
 		return ""
 	}
 	return strings.TrimSpace(probe.PromptCacheKey)
+}
+
+// anthropicChatFingerprint hashes the first user-authored message
+// text from a /v1/messages body. Returns "" only when no user-role
+// message with non-empty user-authored text content is present
+// (parse error, empty messages array, assistant-only history, or
+// every user-role entry is a tool_result wrapper). The "fp-" prefix
+// matches openAIChatFingerprint's shape so audit consumers can
+// recognize the id as a fingerprint regardless of provider.
+//
+// Skips Anthropic tool_result-only messages explicitly. Anthropic's
+// /v1/messages API uses role:"user" for BOTH user-authored turns AND
+// tool_result returns (there is no separate "tool" role like
+// /v1/chat/completions has). flattenAnthropicContent emits tool_result
+// block text alongside real user text, so without the user-authored
+// guard a fingerprint conversation whose history starts at a
+// tool_result wrapper — e.g. a harness replay that truncated the
+// original prompt — would be scoped by tool output instead of the
+// user's actual turn, drifting the per-conversation id every time the
+// upstream tool result changed.
+func anthropicChatFingerprint(body []byte) string {
+	var probe struct {
+		Messages []anthropicMessage `json:"messages"`
+	}
+	if err := json.Unmarshal(body, &probe); err != nil {
+		return ""
+	}
+	for _, msg := range probe.Messages {
+		if msg.Role != "user" {
+			continue
+		}
+		text := strings.TrimSpace(anthropicUserAuthoredText(msg.Content))
+		if text == "" {
+			continue
+		}
+		sum := sha256.Sum256([]byte(text))
+		return "fp-" + hex.EncodeToString(sum[:8])
+	}
+	return ""
+}
+
+// anthropicUserAuthoredText returns text content the user actually
+// typed, ignoring tool_use, tool_result, and harness-injected text
+// blocks. Used by the fingerprint to avoid hashing non-user-authored
+// content as if it were a user turn. Mirrors flattenAnthropicContent's
+// tolerance for both wire shapes (bare string content, array of typed
+// blocks) but filters down to text the user actually authored.
+//
+// Three categories of non-user-authored content this skips:
+//   - tool_use / tool_result blocks (Anthropic wraps tool returns in
+//     role:"user" because there's no "tool" role; without this guard
+//     the fingerprint would be scoped by tool output).
+//   - Harness-injected text blocks whose ENTIRE trimmed content is a
+//     single XML-style wrapping in a lowercase-hyphen tag — Claude
+//     Code's convention for system reminders, slash-command echoes,
+//     file-touch notices, etc. (`<system-reminder>...</system-reminder>`
+//     and friends). These blocks are shared boilerplate across
+//     conversations on the same harness; hashing them would cause
+//     cross-conversation fingerprint collisions whenever the FIRST
+//     surviving user-role message is one of these wrappers (post-
+//     truncation replay, tool_result+reminder pair, etc.).
+//
+// "Mid-text" mentions of `<system-reminder>` or similar tags in user
+// prose are NOT affected — only blocks whose whole content is the
+// wrapper match the skip rule. A block of mixed content (prose +
+// harness wrapper concatenated by the harness into one text block)
+// still gets hashed in full; this is rare and degrades gracefully to
+// the marker mechanism on turn 2+.
+func anthropicUserAuthoredText(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	// Bare-string content is always user-authored — the API doesn't
+	// allow tool_use/tool_result/harness-injection as a bare string,
+	// only inside the typed-blocks shape.
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s
+	}
+	var blocks []struct {
+		Type string `json:"type"`
+		Text string `json:"text,omitempty"`
+	}
+	if err := json.Unmarshal(raw, &blocks); err != nil {
+		return ""
+	}
+	var b strings.Builder
+	for _, blk := range blocks {
+		if blk.Type != "text" || blk.Text == "" {
+			continue
+		}
+		if isHarnessInjectedTextBlock(blk.Text) {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteByte('\n')
+		}
+		b.WriteString(blk.Text)
+	}
+	return b.String()
+}
+
+// harnessInjectedTags is the closed set of tag names whose
+// fully-wrapping text blocks we treat as non-user-authored for
+// fingerprint purposes. Closed-set rather than open-pattern because
+// many legitimate user prompts are entirely a single lowercase-tag
+// wrapping — `<p>...</p>`, `<div>...</div>`, `<html>...</html>`,
+// `<query>SELECT ...</query>`, `<question>...</question>` — and
+// matching by tag shape alone would silently drop a user's actual
+// prompt into the empty bucket.
+//
+// Keep this list in sync with autovault/inbound_shared.go's
+// harnessMetadataTags (the strip-anywhere counterpart used during
+// credential sanitization). If a new harness-injected tag is added
+// there, mirror it here so the fingerprint doesn't collide on shared
+// boilerplate that appears as a standalone text block.
+var harnessInjectedTags = []string{
+	"system-reminder",
+	"available-deferred-tools",
+	"command-name",
+	"command-message",
+	"local-command-caveat",
+	"local-command-stdout",
+	"local-command-stderr",
+	"command-args",
+}
+
+// harnessInjectedTextBlockRE matches a text block whose ENTIRE
+// trimmed content is a single wrapping in one of the
+// harnessInjectedTags names — with the open and close tag names
+// REQUIRED to match.
+//
+// Go's regexp is RE2 (no backreferences), so we can't reuse a capture
+// group across the alternation. Instead, the regex is built as a
+// per-tag alternation where each branch hardcodes the same tag name
+// on both sides: `<system-reminder ...>...</system-reminder>` is one
+// branch, `<command-name ...>...</command-name>` is another, etc.
+// That structurally rules out cross-tag mismatches like
+// `<system-reminder>...</command-name>` from ever matching — no
+// single branch covers both — without relying on the false-positive
+// improbability argument the earlier any-allowlist-on-both-sides
+// pattern leaned on.
+var harnessInjectedTextBlockRE = func() *regexp.Regexp {
+	alts := make([]string, len(harnessInjectedTags))
+	for i, tag := range harnessInjectedTags {
+		q := regexp.QuoteMeta(tag)
+		// Each branch pins both endpoints to the SAME tag name.
+		// (?:\s[^>]*)? allows attributes on the open tag like
+		// `<command-name foo="bar">` without permitting whitespace
+		// or attribute content to leak into the tag-name match.
+		alts[i] = `<` + q + `(?:\s[^>]*)?>[\s\S]*</` + q + `>`
+	}
+	return regexp.MustCompile(`(?s)^\s*(?:` + strings.Join(alts, "|") + `)\s*$`)
+}()
+
+func isHarnessInjectedTextBlock(text string) bool {
+	return harnessInjectedTextBlockRE.MatchString(text)
+}
+
+// openAIResponsesFingerprint hashes the first user input item from a
+// /v1/responses body. Tolerates both wire shapes the Responses API
+// accepts: a top-level `input` string (the simplest shape), and an
+// `input` array of role-tagged items.
+func openAIResponsesFingerprint(body []byte) string {
+	var probe struct {
+		Input json.RawMessage `json:"input"`
+	}
+	if err := json.Unmarshal(body, &probe); err != nil || len(probe.Input) == 0 {
+		return ""
+	}
+	// Shape 1: input is a bare string. The single user turn IS the input.
+	var asString string
+	if err := json.Unmarshal(probe.Input, &asString); err == nil {
+		text := strings.TrimSpace(asString)
+		if text == "" {
+			return ""
+		}
+		sum := sha256.Sum256([]byte(text))
+		return "fp-" + hex.EncodeToString(sum[:8])
+	}
+	// Shape 2: input is an array of items; find the first user-role item.
+	var items []openAIInputItem
+	if err := json.Unmarshal(probe.Input, &items); err != nil {
+		return ""
+	}
+	for _, item := range items {
+		if item.Role != "user" {
+			continue
+		}
+		text := strings.TrimSpace(flattenOpenAIContent(item.Content))
+		if text == "" {
+			continue
+		}
+		sum := sha256.Sum256([]byte(text))
+		return "fp-" + hex.EncodeToString(sum[:8])
+	}
+	return ""
 }
 
 func openAIChatFingerprint(body []byte) string {

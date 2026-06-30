@@ -20,28 +20,257 @@ func TestConversationIDAnthropic(t *testing.T) {
 }
 
 func TestConversationIDAnthropicNoSession(t *testing.T) {
-	// metadata.user_id is present but doesn't contain session_id — should
-	// fall back to empty, not the device_id, because device_id is shared
-	// across conversations on the same install.
-	body := []byte(`{"metadata": {"user_id": "{\"device_id\":\"4228e00a\"}"}}`)
-	if got := ConversationID(nil, ProviderAnthropic, body); got != "" {
-		t.Fatalf("ConversationID without session_id = %q, want empty", got)
+	// metadata.user_id is present but doesn't contain session_id (device_id
+	// is shared across conversations on the same install, so it's not a
+	// valid id source). Falls back to the first-user-message fingerprint
+	// so per-conversation isolation works even for clients that don't set
+	// the Claude-Code-specific session_id field.
+	body := []byte(`{"metadata": {"user_id": "{\"device_id\":\"4228e00a\"}"}, "messages":[{"role":"user","content":"hello"}]}`)
+	got := ConversationID(nil, ProviderAnthropic, body)
+	if !strings.HasPrefix(got, "fp-") {
+		t.Fatalf("ConversationID without session_id = %q, want fp- prefix (fingerprint fallback)", got)
 	}
 }
 
 func TestConversationIDAnthropicMalformed(t *testing.T) {
+	// Each case has no derivable id AND no user message to fingerprint, so
+	// the result is genuinely empty. These are the only cases left where
+	// ConversationID returns "" after the fingerprint fallback.
 	cases := [][]byte{
 		nil,
 		[]byte(``),
 		[]byte(`{"metadata": {}}`),
 		[]byte(`{`),
-		// metadata.user_id is a string but not JSON
+		// metadata.user_id is a string but not JSON; still no messages.
 		[]byte(`{"metadata": {"user_id": "not-json"}}`),
+		// Has messages but only assistant role — no user turn to hash.
+		[]byte(`{"messages":[{"role":"assistant","content":"hi"}]}`),
+		// User-role messages that contain ONLY tool_result blocks must
+		// not be fingerprinted: Anthropic wraps tool returns in
+		// role:"user" because there's no "tool" role, and a
+		// fingerprint computed from tool output would drift the
+		// conversation id every time the tool's response changed.
+		// Skip them; with no other user-authored turn this body has
+		// nothing valid to hash, so the result is empty.
+		[]byte(`{"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_x","content":"ok"}]}]}`),
+		// Mixed: assistant tool_use turn followed by user tool_result
+		// wrapper. Still no user-authored text. Empty.
+		[]byte(`{"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"toolu_x","name":"Read","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_x","content":"file contents"}]}]}`),
+		// Harness-injected text block (system-reminder) as the only
+		// user-role content. Shared boilerplate across conversations;
+		// must NOT fingerprint to a non-empty value or every fresh
+		// conversation on this harness would collide.
+		[]byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"<system-reminder>boilerplate</system-reminder>"}]}]}`),
 	}
 	for _, body := range cases {
 		if got := ConversationID(nil, ProviderAnthropic, body); got != "" {
-			t.Fatalf("ConversationID(%q) = %q, want empty", string(body), got)
+			t.Fatalf("ConversationID(%q) = %q, want empty (no id source + no user message)", string(body), got)
 		}
+	}
+}
+
+// TestConversationIDAnthropicFingerprintFallback pins the per-conversation
+// isolation invariant for raw Anthropic API clients that don't set
+// metadata.user_id at all. Without the fingerprint fallback, every
+// conversation from these clients would collide on "" and share a single
+// task-checkout bucket — exactly the cross-conversation leak this PR
+// closes for Claude Code clients.
+func TestConversationIDAnthropicFingerprintFallback(t *testing.T) {
+	bodyA := []byte(`{"messages":[{"role":"user","content":"build a landing page in /tmp/projA"}]}`)
+	bodyB := []byte(`{"messages":[{"role":"user","content":"build a landing page in /tmp/projB"}]}`)
+	idA := ConversationID(nil, ProviderAnthropic, bodyA)
+	idB := ConversationID(nil, ProviderAnthropic, bodyB)
+	if idA == "" || idB == "" {
+		t.Fatalf("fingerprints must be non-empty: A=%q B=%q", idA, idB)
+	}
+	if !strings.HasPrefix(idA, "fp-") || !strings.HasPrefix(idB, "fp-") {
+		t.Fatalf("fingerprints must carry fp- prefix: A=%q B=%q", idA, idB)
+	}
+	if idA == idB {
+		t.Fatalf("distinct first user messages must partition: both got %q", idA)
+	}
+
+	// Stability: the same first user message produces the same fingerprint
+	// even when later turns differ (only the FIRST user turn is hashed, so
+	// compaction-replaced middle turns can't drift the id).
+	bodyA2 := []byte(`{"messages":[{"role":"user","content":"build a landing page in /tmp/projA"},{"role":"assistant","content":"sure"},{"role":"user","content":"actually scratch that"}]}`)
+	if got := ConversationID(nil, ProviderAnthropic, bodyA2); got != idA {
+		t.Fatalf("fingerprint drifted across turns: turn1=%q turn3=%q", idA, got)
+	}
+
+	// Block-shaped content (Anthropic's array form with text blocks).
+	bodyBlocks := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"build a landing page in /tmp/projA"}]}]}`)
+	if got := ConversationID(nil, ProviderAnthropic, bodyBlocks); got != idA {
+		t.Fatalf("string content and equivalent block content must produce same fingerprint: string=%q blocks=%q", idA, got)
+	}
+
+	// Tool-result skip: Anthropic uses role:"user" for tool returns
+	// (no separate "tool" role), so a fingerprint that hashed
+	// flattenAnthropicContent's tool_result text would be scoped by
+	// tool output instead of the user's actual prompt. After a
+	// harness replay that truncated the original user turn, the
+	// fingerprint must SKIP the tool_result wrapper and find the
+	// next user-authored text — here, the second user turn.
+	bodyToolReplay := []byte(`{"messages":[
+		{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"path":"/etc/hosts"}}]},
+		{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"127.0.0.1 localhost"}]},
+		{"role":"user","content":"build a landing page in /tmp/projA"}
+	]}`)
+	if got := ConversationID(nil, ProviderAnthropic, bodyToolReplay); got != idA {
+		t.Fatalf("tool_result-only user message must be skipped; got %q, want %q (hash of next user-authored text)", got, idA)
+	}
+
+	// Two tool_result-only user wrappers ahead of the real user turn
+	// — must still skip both and arrive at the third user message.
+	bodyDoubleToolReplay := []byte(`{"messages":[
+		{"role":"user","content":[{"type":"tool_result","tool_use_id":"a","content":"first tool output"}]},
+		{"role":"user","content":[{"type":"tool_result","tool_use_id":"b","content":"second tool output"}]},
+		{"role":"user","content":"build a landing page in /tmp/projA"}
+	]}`)
+	if got := ConversationID(nil, ProviderAnthropic, bodyDoubleToolReplay); got != idA {
+		t.Fatalf("consecutive tool_result wrappers must all be skipped; got %q, want %q", got, idA)
+	}
+
+	// Harness-injection skip: Claude Code wraps system reminders,
+	// slash-command echoes, and other harness metadata into text
+	// blocks like "<system-reminder>...</system-reminder>". Those are
+	// shared boilerplate across conversations on the same harness —
+	// hashing them collides every fresh conversation onto the same
+	// fingerprint. Skip blocks whose ENTIRE trimmed content is a
+	// single lowercase-hyphen tag wrapping; the next real user block
+	// wins.
+	bodySysReminder := []byte(`{"messages":[{"role":"user","content":[
+		{"type":"text","text":"<system-reminder>\nThe task tools haven't been used recently...\n</system-reminder>"},
+		{"type":"text","text":"build a landing page in /tmp/projA"}
+	]}]}`)
+	if got := ConversationID(nil, ProviderAnthropic, bodySysReminder); got != idA {
+		t.Fatalf("system-reminder block must be skipped, leaving user prose to hash; got %q, want %q", got, idA)
+	}
+
+	// Different system-reminder content alongside same user prose must
+	// produce same fingerprint — the reminder shouldn't drift the id.
+	bodySysReminderAlt := []byte(`{"messages":[{"role":"user","content":[
+		{"type":"text","text":"<system-reminder>completely different reminder text here</system-reminder>"},
+		{"type":"text","text":"build a landing page in /tmp/projA"}
+	]}]}`)
+	if got := ConversationID(nil, ProviderAnthropic, bodySysReminderAlt); got != idA {
+		t.Fatalf("changing system-reminder content must not drift fingerprint; got %q, want %q", got, idA)
+	}
+
+	// Cross-conversation collision regression: two different
+	// conversations whose ONLY surviving user-role content is a
+	// system-reminder block (post-truncation replay edge case) must
+	// not collide on a shared id. Both should fingerprint to empty
+	// (no user-authored text) and fall through to the next message
+	// or — when there isn't one — return empty rather than a shared
+	// reminder hash.
+	bodyOnlyReminderA := []byte(`{"messages":[{"role":"user","content":[
+		{"type":"text","text":"<system-reminder>shared harness boilerplate</system-reminder>"}
+	]}]}`)
+	bodyOnlyReminderB := []byte(`{"messages":[{"role":"user","content":[
+		{"type":"text","text":"<system-reminder>shared harness boilerplate</system-reminder>"}
+	]}]}`)
+	if got := ConversationID(nil, ProviderAnthropic, bodyOnlyReminderA); got != "" {
+		t.Fatalf("user message containing ONLY a system-reminder must not yield a fingerprint; got %q", got)
+	}
+	if got := ConversationID(nil, ProviderAnthropic, bodyOnlyReminderB); got != "" {
+		t.Fatalf("second conversation with only a system-reminder must also yield empty (no shared-boilerplate collision); got %q", got)
+	}
+
+	// User prose that MENTIONS the system-reminder tag mid-text must
+	// still be included — only blocks that ARE entirely the wrapper
+	// get skipped, so a user asking about the mechanism doesn't
+	// silently lose their fingerprint.
+	bodyUserMentionsTag := []byte(`{"messages":[{"role":"user","content":[
+		{"type":"text","text":"can you explain what <system-reminder> tags do?"}
+	]}]}`)
+	if got := ConversationID(nil, ProviderAnthropic, bodyUserMentionsTag); got == "" {
+		t.Fatalf("user prose mentioning a tag mid-text must still fingerprint; got empty")
+	}
+
+	// Allowlist-not-pattern guard: legitimate user prompts entirely
+	// wrapped in a common lowercase tag MUST still fingerprint. The
+	// prior `[a-z][a-z0-9-]*` open pattern would have silently
+	// skipped these and dropped the user's actual prompt into the
+	// empty bucket — defeating per-conversation isolation by
+	// collapsing every "wrap your prompt in an XML tag" user onto
+	// the same shared id. The closed allowlist of harnessInjectedTags
+	// is what makes the skip safe.
+	for _, body := range []struct {
+		name string
+		body []byte
+	}{
+		{"<p>", []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"<p>build a landing page in /tmp/projA</p>"}]}]}`)},
+		{"<div>", []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"<div>build a landing page in /tmp/projA</div>"}]}]}`)},
+		{"<html>", []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"<html><body>build me a landing page</body></html>"}]}]}`)},
+		{"<query>", []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"<query>SELECT * FROM users WHERE active = 1</query>"}]}]}`)},
+		{"<question>", []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"<question>what is the time complexity of quicksort?</question>"}]}]}`)},
+		// User-invented hyphenated tag that's NOT in the harness
+		// allowlist — must still fingerprint, not be skipped.
+		{"<my-component>", []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"<my-component>render this for me</my-component>"}]}]}`)},
+	} {
+		t.Run("legitimate_user_wrapping_"+body.name+"_still_fingerprints", func(t *testing.T) {
+			got := ConversationID(nil, ProviderAnthropic, body.body)
+			if got == "" {
+				t.Fatalf("user prompt entirely wrapped in %s must still fingerprint (allowlist-bound skip); got empty", body.name)
+			}
+			if !strings.HasPrefix(got, "fp-") {
+				t.Fatalf("expected fp- fingerprint, got %q", got)
+			}
+		})
+	}
+
+	// Cross-tag mismatch rejection: the prior allowlist-on-both-sides
+	// regex (any allowlisted tag on open, any allowlisted tag on
+	// close) could theoretically match a block that opens with one
+	// harness tag and closes with another. The per-tag alternative
+	// regex structurally rules this out — each branch pins both ends
+	// to the same name. A mismatched block like
+	// `<system-reminder>...</command-name>` is therefore NOT a
+	// harness-injection wrapper and MUST be hashed as user-authored
+	// content. Without this guarantee, a malicious user could
+	// suppress their own fingerprint by emitting cross-tag-mismatched
+	// content; with it, they cannot.
+	bodyCrossMismatch := []byte(`{"messages":[{"role":"user","content":[
+		{"type":"text","text":"<system-reminder>build a landing page in /tmp/projA</command-name>"}
+	]}]}`)
+	if got := ConversationID(nil, ProviderAnthropic, bodyCrossMismatch); got == "" {
+		t.Fatalf("cross-tag-mismatched content must NOT be treated as a harness wrapper; got empty")
+	}
+	if !strings.HasPrefix(ConversationID(nil, ProviderAnthropic, bodyCrossMismatch), "fp-") {
+		t.Fatalf("cross-mismatch content must fingerprint normally; got %q", ConversationID(nil, ProviderAnthropic, bodyCrossMismatch))
+	}
+
+	// Other Claude Code harness tags (command-message, command-name,
+	// local-command-stdout) get skipped via the same allowlist —
+	// exercising one to confirm the allowlist branches cover them.
+	bodyCommandEcho := []byte(`{"messages":[{"role":"user","content":[
+		{"type":"text","text":"<command-name>/foo</command-name>"},
+		{"type":"text","text":"build a landing page in /tmp/projA"}
+	]}]}`)
+	if got := ConversationID(nil, ProviderAnthropic, bodyCommandEcho); got != idA {
+		t.Fatalf("command-name harness block must be skipped; got %q, want %q", got, idA)
+	}
+
+	// Mixed-block user message (text + tool_result in the same
+	// content array) keeps the text-only extraction: only the "text"
+	// block contributes to the fingerprint, so swapping the
+	// tool_result payload doesn't drift the id.
+	bodyMixedA := []byte(`{"messages":[{"role":"user","content":[
+		{"type":"tool_result","tool_use_id":"x","content":"OUTPUT_A"},
+		{"type":"text","text":"build a landing page in /tmp/projA"}
+	]}]}`)
+	bodyMixedB := []byte(`{"messages":[{"role":"user","content":[
+		{"type":"tool_result","tool_use_id":"x","content":"OUTPUT_DIFFERENT"},
+		{"type":"text","text":"build a landing page in /tmp/projA"}
+	]}]}`)
+	idMixedA := ConversationID(nil, ProviderAnthropic, bodyMixedA)
+	idMixedB := ConversationID(nil, ProviderAnthropic, bodyMixedB)
+	if idMixedA != idA {
+		t.Fatalf("mixed user content must fingerprint on text only; got %q, want %q", idMixedA, idA)
+	}
+	if idMixedA != idMixedB {
+		t.Fatalf("changing tool_result payload alongside identical text must not drift fingerprint; got %q vs %q", idMixedA, idMixedB)
 	}
 }
 
@@ -64,9 +293,45 @@ func TestConversationIDOpenAIResponses(t *testing.T) {
 
 func TestConversationIDOpenAIResponsesMissingKey(t *testing.T) {
 	req, _ := http.NewRequest("POST", "https://api.openai.com/v1/responses", nil)
+	// No prompt_cache_key AND no input → still empty (no user message
+	// to fingerprint).
 	body := []byte(`{"model":"gpt-5.5"}`)
 	if got := ConversationID(req, ProviderOpenAI, body); got != "" {
-		t.Fatalf("ConversationID without prompt_cache_key = %q, want empty", got)
+		t.Fatalf("ConversationID without prompt_cache_key and no input = %q, want empty", got)
+	}
+}
+
+// TestConversationIDOpenAIResponsesFingerprintFallback pins the
+// fingerprint fallback for /v1/responses clients that don't set
+// prompt_cache_key (everyone except Codex). Covers both wire shapes
+// the Responses API accepts: a bare-string input, and an array of
+// role-tagged input items.
+func TestConversationIDOpenAIResponsesFingerprintFallback(t *testing.T) {
+	req, _ := http.NewRequest("POST", "https://api.openai.com/v1/responses", nil)
+	// Shape 1: bare-string input.
+	bodyString := []byte(`{"model":"gpt-5.5","input":"build a landing page in /tmp/projA"}`)
+	idString := ConversationID(req, ProviderOpenAI, bodyString)
+	if !strings.HasPrefix(idString, "fp-") {
+		t.Fatalf("bare-string input fingerprint = %q, want fp- prefix", idString)
+	}
+	// Shape 2: array of items with a user-role entry. Same text →
+	// same fingerprint as the bare-string shape (callers should be
+	// indifferent to which shape the client picked).
+	bodyArray := []byte(`{"model":"gpt-5.5","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"build a landing page in /tmp/projA"}]}]}`)
+	idArray := ConversationID(req, ProviderOpenAI, bodyArray)
+	if idArray != idString {
+		t.Fatalf("string-shape and equivalent array-shape fingerprints must match: string=%q array=%q", idString, idArray)
+	}
+	// Distinct first messages partition.
+	bodyB := []byte(`{"model":"gpt-5.5","input":"build a landing page in /tmp/projB"}`)
+	idB := ConversationID(req, ProviderOpenAI, bodyB)
+	if idB == idString {
+		t.Fatalf("distinct inputs must partition; both got %q", idString)
+	}
+	// prompt_cache_key still wins when present.
+	bodyWithKey := []byte(`{"model":"gpt-5.5","prompt_cache_key":"019e55ba-3a42-7932-9262-b71c9c7e6281","input":"hello"}`)
+	if got := ConversationID(req, ProviderOpenAI, bodyWithKey); got != "019e55ba-3a42-7932-9262-b71c9c7e6281" {
+		t.Fatalf("native key must take precedence over fingerprint; got %q", got)
 	}
 }
 
